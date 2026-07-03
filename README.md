@@ -105,7 +105,10 @@ with a `subprocess` call to the real engine and parse its result:
   after the similarity fit, a sparse Levenberg–Marquardt bundle adjustment
   (scipy `least_squares`, analytic sparsity) re-solves camera poses + tie points
   to minimise reprojection error, holding GCPs fixed as control. Runs when a
-  COLMAP reconstruction with a tie-point graph is available.
+  COLMAP reconstruction with a tie-point graph is available. **Self-calibration**:
+  when a single shared camera model has enough observations, it also refines the
+  intrinsics — focal length, principal point and radial distortion `k1` — which
+  removes the systematic error of assuming a fixed pinhole on distorted imagery.
 - **dense** → **✅ wired** ([`pipeline/openmvs.py`](aerosurvey/pipeline/openmvs.py)):
   runs COLMAP `image_undistorter` → OpenMVS `InterfaceCOLMAP` → `DensifyPointCloud`,
   reads the dense PLY (Open3D) and carries it into the project CRS via the georef

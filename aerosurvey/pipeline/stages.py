@@ -409,8 +409,19 @@ def _refine_bundle(ctx: StageContext, ch, res, sim) -> None:
     points_c = points - offset
     tvecs_c = np.array([tvecs[i] + Rotation.from_rotvec(rvecs[i]).as_matrix() @ offset
                         for i in range(len(rvecs))])
+
+    # Self-calibrate a shared intrinsic model only when it is well-conditioned:
+    # a single camera model and plenty of observations. Otherwise hold K fixed.
+    cam_ids = {res.poses[n].camera_id for n in cam_index}
+    shared, refine_intr = None, False
+    if len(cam_ids) == 1 and len(obs) > 15 * len(rvecs):
+        K0 = np.asarray(Ks[0], float)
+        shared = np.array([(K0[0, 0] + K0[1, 1]) / 2.0, K0[0, 2], K0[1, 2], 0.0])
+        refine_intr = True
+
     r = bundle.bundle_adjust(rvecs, tvecs_c, np.array(Ks), points_c, fixed, obs,
-                             refine_points=True)
+                             refine_points=True, shared_intrinsics=shared,
+                             refine_intrinsics=refine_intr)
     name_to_cam = {c.filename: c for c in ch.cameras}
     for name, ci in cam_index.items():
         cam = name_to_cam.get(name)
@@ -419,6 +430,10 @@ def _refine_bundle(ctx: StageContext, ch, res, sim) -> None:
             cam.est_x, cam.est_y, cam.est_z = float(center[0]), float(center[1]), float(center[2])
     ctx.log(f"Bundle adjustment: reprojection RMSE {r.rmse_before:.3f} -> "
             f"{r.rmse_after:.3f} px over {r.n_obs} observations.", "ok")
+    if r.intrinsics is not None:
+        ctx.log(f"Self-calibration: focal {shared[0]:.1f} -> {r.intrinsics[0]:.1f} px, "
+                f"principal ({r.intrinsics[1]:.1f}, {r.intrinsics[2]:.1f}), "
+                f"k1 {r.intrinsics[3]:+.5f}.", "info")
 
 
 def _georef_from_gps(ctx, ch, tf, georef):
