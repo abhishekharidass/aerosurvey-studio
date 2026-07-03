@@ -191,10 +191,61 @@ def _load_cloud(path):
 # Stage implementations
 # ---------------------------------------------------------------------------
 def run_align(ctx: StageContext) -> bool:
-    ch = ctx.chunk
-    cams = [c for c in ch.cameras if c.enabled]
+    """Aerial triangulation. Uses COLMAP if installed, else the simulation."""
+    from . import colmap
+    cams = [c for c in ctx.chunk.cameras if c.enabled]
+    if not cams:
+        ctx.log("No enabled cameras to align.", "error")
+        return False
+    if colmap.available():
+        ctx.log(f"COLMAP detected at {colmap.exe()}", "info")
+        return _align_colmap(ctx, cams, colmap)
+    ctx.log("COLMAP not found on PATH — using built-in simulation for alignment.", "warn")
+    return _align_simulated(ctx, cams)
+
+
+def _align_colmap(ctx: StageContext, cams, colmap) -> bool:
+    image_paths = [c.path for c in cams if os.path.exists(c.path)]
+    if len(cams) - len(image_paths):
+        ctx.log(f"{len(cams) - len(image_paths)} image file(s) missing on disk; excluded.", "warn")
+    if len(image_paths) < 2:
+        ctx.log("Need at least 2 images on disk for COLMAP SfM.", "error")
+        return False
+    ctx.log(f"Structure-from-Motion on {len(image_paths)} images (feature extraction, "
+            "matching, incremental mapping)...", "info")
+    res = colmap.run_sfm(image_paths, ctx.workdir, ctx)
+    if res is None:
+        return False
+
+    by_name = {c.filename: c for c in cams}
+    matched = 0
+    for name, pose in res.poses.items():
+        cam = by_name.get(name)
+        if cam is not None:
+            cam.est_x, cam.est_y, cam.est_z = (float(pose.center[0]),
+                                               float(pose.center[1]),
+                                               float(pose.center[2]))
+            cam.aligned = True
+            matched += 1
+    ctx.chunk.aligned = matched > 0
+
+    if len(res.points):
+        out = os.path.join(ctx.workdir, "sparse_cloud.las")
+        _write_las(out, res.points, res.colors, np.ones(len(res.points), np.uint8))
+        ctx.chunk.outputs.sparse_cloud = out
+        ctx.log(f"Sparse cloud: {len(res.points):,} tie points -> {out}", "info")
+
+    ctx.log(f"COLMAP aligned {matched}/{len(cams)} cameras "
+            f"(mean reprojection error {res.mean_reproj_error:.3f} px).", "ok")
+    ctx.log("Note: poses are in COLMAP's local frame; georeferencing to GCPs/GPS is a "
+            "later step (model_aligner + GCP-constrained bundle adjustment).", "info")
+    ctx.progress(100)
+    return matched > 0
+
+
+def _align_simulated(ctx: StageContext, cams) -> bool:
     ctx.log(f"Detecting features on {len(cams)} images (SIFT-equivalent)...", "info")
-    for i, cam in enumerate(cams):
+    for i, _cam in enumerate(cams):
         if not ctx.sleep(0.03):
             return False
         ctx.progress(int(30 * (i + 1) / max(len(cams), 1)))
@@ -205,14 +256,13 @@ def run_align(ctx: StageContext) -> bool:
     ctx.log("Bundle adjustment (Levenberg-Marquardt on sparse Jacobian)...", "info")
     if not ctx.sleep(0.8):
         return False
-    # Assign estimated positions from geotags (already in project CRS via ingest) or synthetic
     rng = np.random.default_rng(1)
     for cam in cams:
         cam.est_x = cam.est_x if cam.est_x is not None else float(rng.uniform(0, DOMAIN))
         cam.est_y = cam.est_y if cam.est_y is not None else float(rng.uniform(0, DOMAIN))
         cam.est_z = cam.est_z if cam.est_z is not None else float(rng.uniform(60, 90))
         cam.aligned = True
-    ch.aligned = True
+    ctx.chunk.aligned = True
     err = np.abs(rng.normal(0, 0.35, 4000))
     ctx.log(f"Aligned {len(cams)} cameras. Mean reprojection error "
             f"{err.mean():.3f} px (Gaussian, sigma {err.std():.3f}).", "ok")

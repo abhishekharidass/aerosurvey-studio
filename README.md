@@ -90,8 +90,11 @@ Each stage in `aerosurvey/pipeline/stages.py` is a function `run_x(ctx)` that
 today produces simulated output. To go production for a stage, replace its body
 with a `subprocess` call to the real engine and parse its result:
 
-- **align** → COLMAP `feature_extractor` / `exhaustive_matcher` / `mapper`, then
-  read cameras + sparse cloud; inject GCPs into a second bundle adjustment.
+- **align** → **✅ wired** ([`pipeline/colmap.py`](aerosurvey/pipeline/colmap.py)):
+  runs COLMAP `feature_extractor` / `exhaustive_matcher` / `mapper`, parses the
+  sparse model, sets camera poses and saves a sparse tie-point cloud. Falls back
+  to the simulation when COLMAP isn't on PATH. *Still to do:* georeference the
+  local SfM frame via `model_aligner` (GPS) and a GCP-constrained bundle adjustment.
 - **dense** → OpenMVS `DensifyPointCloud` (or COLMAP `patch_match_stereo` +
   `stereo_fusion`).
 - **classify** → PDAL pipeline (`filters.smrf` / `filters.csf` for ground).

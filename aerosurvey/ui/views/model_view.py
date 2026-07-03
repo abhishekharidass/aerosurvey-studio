@@ -109,6 +109,8 @@ class ModelView(QWidget):
             items.append(("Classified cloud", o.classified_cloud, "cloud"))
         if o.dense_cloud:
             items.append(("Dense cloud", o.dense_cloud, "cloud"))
+        if o.sparse_cloud:
+            items.append(("Sparse cloud (SfM)", o.sparse_cloud, "cloud"))
         if o.dsm:
             items.append(("DSM", o.dsm, "raster"))
         if o.dtm:
