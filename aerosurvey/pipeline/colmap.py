@@ -56,14 +56,23 @@ class CameraPose:
     qvec: np.ndarray
     tvec: np.ndarray
     center: np.ndarray
+    camera_id: int = 0
 
 
 @dataclass
 class ColmapResult:
-    poses: Dict[str, CameraPose] = field(default_factory=dict)   # basename -> pose
+    poses: Dict[str, CameraPose] = field(default_factory=dict)     # basename -> pose
+    intrinsics: Dict[int, np.ndarray] = field(default_factory=dict)  # camera_id -> 3x3 K
     points: np.ndarray = field(default_factory=lambda: np.zeros((0, 3)))
     colors: np.ndarray = field(default_factory=lambda: np.zeros((0, 3), np.uint8))
     mean_reproj_error: float = 0.0
+
+    def projection(self, pose: "CameraPose"):
+        """3x4 projection matrix for a pose, or None if intrinsics are unknown."""
+        K = self.intrinsics.get(pose.camera_id)
+        if K is None:
+            return None
+        return K @ np.hstack([qvec2rotmat(pose.qvec), np.asarray(pose.tvec).reshape(3, 1)])
 
 
 # ---------------------------------------------------------------------------
@@ -82,9 +91,37 @@ def parse_images_txt(path: str) -> Dict[str, CameraPose]:
             continue
         qvec = np.array(list(map(float, parts[1:5])))
         tvec = np.array(list(map(float, parts[5:8])))
+        camera_id = int(parts[8])
         name = os.path.basename(parts[9])
-        poses[name] = CameraPose(name, qvec, tvec, camera_center(qvec, tvec))
+        poses[name] = CameraPose(name, qvec, tvec, camera_center(qvec, tvec), camera_id)
     return poses
+
+
+def _k_from_model(model: str, params) -> np.ndarray:
+    p = [float(v) for v in params]
+    two_focal = {"PINHOLE", "OPENCV", "OPENCV_FISHEYE", "FULL_OPENCV",
+                 "THIN_PRISM_FISHEYE"}
+    if model in two_focal and len(p) >= 4:
+        fx, fy, cx, cy = p[0], p[1], p[2], p[3]
+        return np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
+    # SIMPLE_PINHOLE / SIMPLE_RADIAL / RADIAL / *_FISHEYE: f, cx, cy, [dist...]
+    f = p[0]
+    cx = p[1] if len(p) > 1 else 0.0
+    cy = p[2] if len(p) > 2 else 0.0
+    return np.array([[f, 0, cx], [0, f, cy], [0, 0, 1]], dtype=np.float64)
+
+
+def parse_cameras_txt(path: str) -> Dict[int, np.ndarray]:
+    intr: Dict[int, np.ndarray] = {}
+    with open(path, "r", encoding="utf-8") as fh:
+        for ln in fh:
+            if ln.startswith("#") or not ln.strip():
+                continue
+            p = ln.split()
+            if len(p) < 5:
+                continue
+            intr[int(p[0])] = _k_from_model(p[1], p[4:])
+    return intr
 
 
 def parse_points3d_txt(path: str):
@@ -111,6 +148,9 @@ def read_model_dir(model_dir: str) -> ColmapResult:
     res = ColmapResult()
     img_txt = os.path.join(model_dir, "images.txt")
     pts_txt = os.path.join(model_dir, "points3D.txt")
+    cam_txt = os.path.join(model_dir, "cameras.txt")
+    if os.path.exists(cam_txt):
+        res.intrinsics = parse_cameras_txt(cam_txt)
     if os.path.exists(img_txt):
         res.poses = parse_images_txt(img_txt)
     if os.path.exists(pts_txt):

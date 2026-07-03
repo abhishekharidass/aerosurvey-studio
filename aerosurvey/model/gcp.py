@@ -30,6 +30,8 @@ class GCP:
     enabled: bool = True
     # Accuracy (m) — how tightly this anchors the bundle adjustment.
     accuracy: float = 0.02
+    # Residual (m) after georeferencing; None until computed.
+    error: Optional[float] = None
 
     observations: Dict[int, Observation] = field(default_factory=dict)
 

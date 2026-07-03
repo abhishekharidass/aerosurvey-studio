@@ -216,6 +216,7 @@ def _align_colmap(ctx: StageContext, cams, colmap) -> bool:
     res = colmap.run_sfm(image_paths, ctx.workdir, ctx)
     if res is None:
         return False
+    ctx.chunk._colmap_result = res  # transient: consumed by the georef stage
 
     by_name = {c.filename: c for c in cams}
     matched = 0
@@ -268,6 +269,108 @@ def _align_simulated(ctx: StageContext, cams) -> bool:
             f"{err.mean():.3f} px (Gaussian, sigma {err.std():.3f}).", "ok")
     ctx.progress(100)
     return True
+
+
+def _transform_las(path: str, sim) -> None:
+    P, C, cls = _load_cloud(path)
+    _write_las(path, sim.apply(P), C, cls)
+
+
+def run_georef(ctx: StageContext) -> bool:
+    """Optimize / georeference: fit the reconstruction into the project CRS,
+    preferring surveyed GCPs and falling back to camera GPS."""
+    from . import georef
+    from ..core import crs as crsmod
+    ch = ctx.chunk
+    if not ch.aligned:
+        ctx.log("Run 'Align Photos' before georeferencing.", "error")
+        return False
+    for g in ch.gcps:
+        g.error = None
+
+    tf = crsmod.CrsTransform(ch.epsg if ch.crs_mode != "local" else None)
+    res = getattr(ch, "_colmap_result", None)
+    sim = None
+
+    if res is not None and ch.gcps:
+        sim = _georef_from_gcps(ctx, ch, res, georef)   # accurate, real reconstruction
+    if sim is None:
+        sim = _georef_from_gps(ctx, ch, tf, georef)     # GPS similarity fallback
+    if sim is None:
+        ctx.log("Not enough control to georeference (need >=3 geotagged aligned "
+                "cameras, or >=3 triangulable control GCPs).", "error")
+        return False
+
+    for c in ch.cameras:
+        if c.est_x is not None:
+            x, y, z = sim.apply([c.est_x, c.est_y, c.est_z])
+            c.est_x, c.est_y, c.est_z = float(x), float(y), float(z)
+    if ch.outputs.sparse_cloud and os.path.exists(ch.outputs.sparse_cloud):
+        _transform_las(ch.outputs.sparse_cloud, sim)
+        ctx.log("Sparse cloud transformed into project CRS.", "info")
+
+    ch.optimized = True
+    ctx.progress(100)
+    return True
+
+
+def _georef_from_gps(ctx, ch, tf, georef):
+    local, world = [], []
+    for c in ch.cameras:
+        if c.aligned and c.est_x is not None and c.has_geotag:
+            local.append([c.est_x, c.est_y, c.est_z])
+            world.append(list(tf.forward(c.lon, c.lat, c.alt or 0.0)))
+    if len(local) < 3:
+        return None
+    sim = georef.umeyama_similarity(np.array(local), np.array(world))
+    fit = georef.residuals(np.array(local), np.array(world), sim)
+    ctx.log(f"GPS georeferencing from {len(local)} cameras: RMSE {fit.rmse:.3f} m "
+            f"(X {fit.rmse_axis[0]:.3f}, Y {fit.rmse_axis[1]:.3f}, Z {fit.rmse_axis[2]:.3f}).",
+            "ok")
+    return sim
+
+
+def _georef_from_gcps(ctx, ch, res, georef):
+    pose_by_cam = {c.id: res.poses[c.filename] for c in ch.cameras
+                   if c.filename in res.poses}
+    local, world, labels, checks = [], [], [], []
+    for g in ch.gcps:
+        if not g.enabled:
+            continue
+        proj, uvs = [], []
+        for cam_id, obs in g.observations.items():
+            pose = pose_by_cam.get(cam_id)
+            if pose is None:
+                continue
+            P = res.projection(pose)
+            if P is None:
+                continue
+            proj.append(P)
+            uvs.append((obs.px, obs.py))
+        if len(proj) < 2:  # need >=2 rays to triangulate
+            continue
+        local.append(georef.dlt_triangulate(proj, uvs))
+        world.append([g.x, g.y, g.z])
+        labels.append(g)
+        checks.append(g.is_check)
+    control = [i for i, chk in enumerate(checks) if not chk]
+    if len(control) < 3:
+        if labels:
+            ctx.log(f"Only {len(control)} triangulable control GCP(s) (need >=3); "
+                    "using GPS instead.", "warn")
+        return None
+    L, W, ctrl = np.array(local), np.array(world), np.array(control)
+    sim = georef.umeyama_similarity(L[ctrl], W[ctrl])
+    fit = georef.residuals(L, W, sim)
+    for g, e in zip(labels, fit.per_point):
+        g.error = float(e)
+    ctx.log(f"GCP georeferencing: {len(control)} control, {len(checks) - len(control)} check. "
+            f"Control RMSE {np.sqrt(np.mean(fit.per_point[ctrl] ** 2)):.3f} m.", "ok")
+    check = np.array([i for i, chk in enumerate(checks) if chk], dtype=int)
+    if len(check):
+        ctx.log(f"Independent check-point RMSE "
+                f"{np.sqrt(np.mean(fit.per_point[check] ** 2)):.3f} m.", "ok")
+    return sim
 
 
 def run_dense(ctx: StageContext) -> bool:
@@ -415,6 +518,8 @@ class Stage:
 
 PIPELINE: List[Stage] = [
     Stage("align", "Align Photos", "colmap", run_align, "Sparse cloud + camera poses"),
+    Stage("georef", "Optimize / Georeference", "internal", run_georef,
+          "Cameras in project CRS + GCP accuracy report"),
     Stage("dense", "Build Dense Cloud", "openmvs", run_dense, "Dense point cloud (LAS)"),
     Stage("classify", "Classify Points", "pdal", run_classify, "Classified cloud"),
     Stage("dsm", "Build DSM", "gdal", run_dsm, "Digital Surface Model (GeoTIFF)"),

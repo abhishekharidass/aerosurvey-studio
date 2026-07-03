@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QHBoxLayout, QHeaderView,
 
 from ...theme import FG_MUTED
 
-GCP_COLS = ["Label", "X / East", "Y / North", "Z", "Type", "Acc (m)", "Images"]
+GCP_COLS = ["Label", "X / East", "Y / North", "Z", "Type", "Acc (m)", "Images", "Error (m)"]
 CAM_COLS = ["Image", "Lat", "Lon", "Alt", "Yaw", "Est X", "Est Y", "Est Z"]
 
 
@@ -81,8 +81,9 @@ class ReferencePanel(QWidget):
         for g in self.state.chunk.gcps:
             r = t.rowCount()
             t.insertRow(r)
+            err = "" if g.error is None else f"{g.error:.3f}"
             vals = [g.label, f"{g.x:.3f}", f"{g.y:.3f}", f"{g.z:.3f}",
-                    g.kind, f"{g.accuracy:.3f}", str(g.marked_count)]
+                    g.kind, f"{g.accuracy:.3f}", str(g.marked_count), err]
             for c, v in enumerate(vals):
                 item = QTableWidgetItem(v)
                 item.setData(Qt.UserRole, g.id)
@@ -92,7 +93,12 @@ class ReferencePanel(QWidget):
                 if c == 6:  # images count read-only
                     item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                     item.setForeground(Qt.gray)
-                if c in (1, 2, 3, 5):
+                if c == 7:  # georef residual read-only, colour-graded
+                    item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                    if g.error is not None:
+                        item.setForeground(Qt.green if g.error < 0.05
+                                           else (Qt.yellow if g.error < 0.2 else Qt.red))
+                if c in (1, 2, 3, 5, 7):
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 t.setItem(r, c, item)
         self._updating = False

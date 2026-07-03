@@ -25,7 +25,8 @@ stages one module at a time (see *Wiring real engines* below).
 | **Photos** | List, sort by name / capture time / **proximity to a selected GCP** |
 | **GCPs** | Add / edit / remove, import from CSV (`label,x,y,z[,type]`), control vs check points |
 | **GCP marking** | Zoom, pan, **click to place**, **drag to move**, **right-click / Delete to remove** markers; every GCP shown per image, active one highlighted; live pixel readout |
-| **Pipeline** | Align → Dense cloud → Classify → DSM → DTM → Orthomosaic, on a background thread with progress + cancel + console log |
+| **Pipeline** | Align → **Optimize/Georeference** → Dense cloud → Classify → DSM → DTM → Orthomosaic, on a background thread with progress + cancel + console log |
+| **Georeferencing** | 7-param similarity fit into the project CRS from camera GPS, or from triangulated GCP marks (control/check split); per-GCP residual + control/check RMSE reported ([`pipeline/georef.py`](aerosurvey/pipeline/georef.py)) |
 | **Point cloud** | Classified LAS (ground / vegetation / building), top-down preview, **interactive Open3D viewer**, colour by RGB or class |
 | **Surfaces** | DSM (max-Z), DTM (ground-only), Orthomosaic (RGB) as **LZW GeoTIFF with EPSG + geotransform** — opens natively in QGIS |
 | **Export** | Copy all products (LAS + GeoTIFFs) to a folder |
@@ -93,8 +94,13 @@ with a `subprocess` call to the real engine and parse its result:
 - **align** → **✅ wired** ([`pipeline/colmap.py`](aerosurvey/pipeline/colmap.py)):
   runs COLMAP `feature_extractor` / `exhaustive_matcher` / `mapper`, parses the
   sparse model, sets camera poses and saves a sparse tie-point cloud. Falls back
-  to the simulation when COLMAP isn't on PATH. *Still to do:* georeference the
-  local SfM frame via `model_aligner` (GPS) and a GCP-constrained bundle adjustment.
+  to the simulation when COLMAP isn't on PATH.
+- **georef** → **✅ wired** ([`pipeline/georef.py`](aerosurvey/pipeline/georef.py)):
+  Umeyama similarity fit + DLT triangulation. Georeferences the local SfM frame
+  into the project CRS using triangulated GCP marks (preferred) or camera GPS
+  (fallback), and reports control/check residuals (shown in the Reference panel's
+  *Error (m)* column). *Still to do:* full GCP-constrained bundle adjustment
+  (currently a rigid similarity fit, not a re-solve of camera parameters).
 - **dense** → OpenMVS `DensifyPointCloud` (or COLMAP `patch_match_stereo` +
   `stereo_fusion`).
 - **classify** → PDAL pipeline (`filters.smrf` / `filters.csf` for ground).
