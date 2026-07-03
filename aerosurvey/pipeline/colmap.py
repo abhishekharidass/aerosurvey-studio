@@ -65,6 +65,8 @@ class ColmapResult:
     intrinsics: Dict[int, np.ndarray] = field(default_factory=dict)  # camera_id -> 3x3 K
     points: np.ndarray = field(default_factory=lambda: np.zeros((0, 3)))
     colors: np.ndarray = field(default_factory=lambda: np.zeros((0, 3), np.uint8))
+    point_ids: np.ndarray = field(default_factory=lambda: np.zeros(0, np.int64))
+    observations: list = field(default_factory=list)  # (image_name, point3d_id, u, v)
     mean_reproj_error: float = 0.0
     model_dir: str = ""   # sparse model folder (for downstream OpenMVS)
     image_dir: str = ""   # staged image folder
@@ -80,15 +82,18 @@ class ColmapResult:
 # ---------------------------------------------------------------------------
 # Text-model parsers (COLMAP sparse model exported with --output_type TXT)
 # ---------------------------------------------------------------------------
-def parse_images_txt(path: str) -> Dict[str, CameraPose]:
+def parse_images_txt(path: str):
+    """Returns (poses: name->CameraPose, observations: [(name, point3d_id, u, v)])."""
     poses: Dict[str, CameraPose] = {}
+    observations: list = []
     with open(path, "r", encoding="utf-8") as fh:
         lines = [ln for ln in fh if not ln.startswith("#")]
-    # Records are two lines each: pose line, then a POINTS2D line we skip.
+    # Records are two lines each: pose line, then a POINTS2D line.
     i = 0
     while i < len(lines):
         parts = lines[i].split()
-        i += 2  # skip the points2D line
+        pts_line = lines[i + 1] if i + 1 < len(lines) else ""
+        i += 2
         if len(parts) < 10:
             continue
         qvec = np.array(list(map(float, parts[1:5])))
@@ -96,7 +101,12 @@ def parse_images_txt(path: str) -> Dict[str, CameraPose]:
         camera_id = int(parts[8])
         name = os.path.basename(parts[9])
         poses[name] = CameraPose(name, qvec, tvec, camera_center(qvec, tvec), camera_id)
-    return poses
+        toks = pts_line.split()
+        for j in range(0, len(toks) - 2, 3):
+            pid = int(float(toks[j + 2]))
+            if pid >= 0:
+                observations.append((name, pid, float(toks[j]), float(toks[j + 1])))
+    return poses, observations
 
 
 def _k_from_model(model: str, params) -> np.ndarray:
@@ -127,6 +137,7 @@ def parse_cameras_txt(path: str) -> Dict[int, np.ndarray]:
 
 
 def parse_points3d_txt(path: str):
+    ids: List[int] = []
     xyz: List[List[float]] = []
     rgb: List[List[int]] = []
     errs: List[float] = []
@@ -137,13 +148,15 @@ def parse_points3d_txt(path: str):
             p = ln.split()
             if len(p) < 8:
                 continue
+            ids.append(int(p[0]))
             xyz.append([float(p[1]), float(p[2]), float(p[3])])
             rgb.append([int(p[4]), int(p[5]), int(p[6])])
             errs.append(float(p[7]))
     pts = np.array(xyz, dtype=np.float64) if xyz else np.zeros((0, 3))
     cols = np.array(rgb, dtype=np.uint8) if rgb else np.zeros((0, 3), np.uint8)
     err = float(np.mean(errs)) if errs else 0.0
-    return pts, cols, err
+    pid = np.array(ids, dtype=np.int64) if ids else np.zeros(0, np.int64)
+    return pts, cols, err, pid
 
 
 def read_model_dir(model_dir: str) -> ColmapResult:
@@ -154,9 +167,9 @@ def read_model_dir(model_dir: str) -> ColmapResult:
     if os.path.exists(cam_txt):
         res.intrinsics = parse_cameras_txt(cam_txt)
     if os.path.exists(img_txt):
-        res.poses = parse_images_txt(img_txt)
+        res.poses, res.observations = parse_images_txt(img_txt)
     if os.path.exists(pts_txt):
-        res.points, res.colors, res.mean_reproj_error = parse_points3d_txt(pts_txt)
+        res.points, res.colors, res.mean_reproj_error, res.point_ids = parse_points3d_txt(pts_txt)
     return res
 
 

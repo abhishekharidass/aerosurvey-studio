@@ -27,6 +27,7 @@ stages one module at a time (see *Wiring real engines* below).
 | **GCP marking** | Zoom, pan, **click to place**, **drag to move**, **right-click / Delete to remove** markers; every GCP shown per image, active one highlighted; live pixel readout |
 | **Pipeline** | Align → **Optimize/Georeference** → Dense cloud → Classify → DSM → DTM → Orthomosaic, on a background thread with progress + cancel + console log |
 | **Georeferencing** | 7-param similarity fit into the project CRS from camera GPS, or from triangulated GCP marks (control/check split); per-GCP residual + control/check RMSE reported ([`pipeline/georef.py`](aerosurvey/pipeline/georef.py)) |
+| **Bundle adjustment** | Sparse LM bundle adjustment (scipy) re-solving camera poses + tie points against GCP control, minimising reprojection error ([`pipeline/bundle.py`](aerosurvey/pipeline/bundle.py)) |
 | **Point cloud** | Classified LAS (ground / vegetation / building), top-down preview, **interactive Open3D viewer**, colour by RGB or class |
 | **Surfaces** | DSM (max-Z), DTM (ground-only), Orthomosaic (RGB) as **LZW GeoTIFF with EPSG + geotransform** — opens natively in QGIS |
 | **Export** | Copy all products (LAS + GeoTIFFs) to a folder |
@@ -99,8 +100,12 @@ with a `subprocess` call to the real engine and parse its result:
   Umeyama similarity fit + DLT triangulation. Georeferences the local SfM frame
   into the project CRS using triangulated GCP marks (preferred) or camera GPS
   (fallback), and reports control/check residuals (shown in the Reference panel's
-  *Error (m)* column). *Still to do:* full GCP-constrained bundle adjustment
-  (currently a rigid similarity fit, not a re-solve of camera parameters).
+  *Error (m)* column).
+- **bundle adjustment** → **✅ wired** ([`pipeline/bundle.py`](aerosurvey/pipeline/bundle.py)):
+  after the similarity fit, a sparse Levenberg–Marquardt bundle adjustment
+  (scipy `least_squares`, analytic sparsity) re-solves camera poses + tie points
+  to minimise reprojection error, holding GCPs fixed as control. Runs when a
+  COLMAP reconstruction with a tie-point graph is available.
 - **dense** → **✅ wired** ([`pipeline/openmvs.py`](aerosurvey/pipeline/openmvs.py)):
   runs COLMAP `image_undistorter` → OpenMVS `InterfaceCOLMAP` → `DensifyPointCloud`,
   reads the dense PLY (Open3D) and carries it into the project CRS via the georef

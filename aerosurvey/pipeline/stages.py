@@ -334,9 +334,91 @@ def run_georef(ctx: StageContext) -> bool:
         ctx.log("Sparse cloud transformed into project CRS.", "info")
 
     ch._georef_sim = sim  # transient: applied to the dense cloud (still local on disk)
+    if res is not None and getattr(res, "observations", None):
+        try:
+            _refine_bundle(ctx, ch, res, sim)
+        except Exception as exc:
+            ctx.log(f"Bundle adjustment skipped ({exc}).", "warn")
     ch.optimized = True
     ctx.progress(100)
     return True
+
+
+def _refine_bundle(ctx: StageContext, ch, res, sim) -> None:
+    """GCP-constrained bundle adjustment: refine world camera poses + tie points
+    so both tie-point and GCP marks reproject consistently. GCPs are held fixed."""
+    from scipy.spatial.transform import Rotation
+    from . import bundle, colmap
+    if not res.intrinsics or not res.poses:
+        return
+
+    Rs, s, ts = sim.R, sim.s, sim.t
+    cam_index, rvecs, tvecs, Ks = {}, [], [], []
+    for name, pose in res.poses.items():
+        K = res.intrinsics.get(pose.camera_id)
+        if K is None:
+            continue
+        Rw = colmap.qvec2rotmat(pose.qvec) @ Rs.T           # local pose -> world pose
+        tw = s * np.asarray(pose.tvec) - Rw @ ts
+        cam_index[name] = len(rvecs)
+        rvecs.append(Rotation.from_matrix(Rw).as_rotvec())
+        tvecs.append(tw)
+        Ks.append(K)
+    if len(rvecs) < 2:
+        return
+
+    # tie points (subsampled) into the world frame, all free
+    rng = np.random.default_rng(0)
+    tie = sim.apply(res.points) if len(res.points) else np.zeros((0, 3))
+    keep = (rng.choice(len(tie), 4000, replace=False) if len(tie) > 4000
+            else np.arange(len(tie)))
+    tie = tie[keep]
+    pid_row = {int(pid): i for i, pid in enumerate(res.point_ids[keep])}
+
+    # GCP points, fixed at surveyed world coords
+    gcps = [g for g in ch.gcps if g.enabled and g.observations]
+    gcp_row = {g.id: len(tie) + i for i, g in enumerate(gcps)}
+    gcp_world = np.array([[g.x, g.y, g.z] for g in gcps]) if gcps else np.zeros((0, 3))
+    points = np.vstack([tie, gcp_world]) if len(gcp_world) else tie
+    fixed = np.concatenate([np.zeros(len(tie), bool), np.ones(len(gcp_world), bool)])
+
+    obs = [[cam_index[n], pid_row[p], u, v] for (n, p, u, v) in res.observations
+           if n in cam_index and p in pid_row]
+    id2cam = {c.id: c for c in ch.cameras}
+    n_gcp_obs = 0
+    for g in gcps:
+        row = gcp_row[g.id]
+        for cam_id, ob in g.observations.items():
+            cam = id2cam.get(cam_id)
+            ci = cam_index.get(cam.filename) if cam else None
+            if ci is not None:
+                obs.append([ci, row, ob.px, ob.py])
+                n_gcp_obs += 1
+    obs = np.array(obs, dtype=float)
+
+    if len(gcp_world) < 3 or n_gcp_obs < 6 or len(obs) < 6 * len(rvecs):
+        ctx.log("Bundle adjustment skipped (need >=3 fixed GCPs with enough marks).", "info")
+        return
+
+    ctx.log(f"GCP-constrained bundle adjustment: {len(rvecs)} cameras, {len(points)} "
+            f"points ({len(gcp_world)} fixed GCPs), {len(obs)} observations...", "info")
+    # Centre the problem: world coords are ~1e6 (UTM), which ill-conditions the solve.
+    rvecs = np.array(rvecs)
+    tvecs = np.array(tvecs)
+    offset = points.mean(axis=0)
+    points_c = points - offset
+    tvecs_c = np.array([tvecs[i] + Rotation.from_rotvec(rvecs[i]).as_matrix() @ offset
+                        for i in range(len(rvecs))])
+    r = bundle.bundle_adjust(rvecs, tvecs_c, np.array(Ks), points_c, fixed, obs,
+                             refine_points=True)
+    name_to_cam = {c.filename: c for c in ch.cameras}
+    for name, ci in cam_index.items():
+        cam = name_to_cam.get(name)
+        if cam is not None:
+            center = bundle.center_from_rt(r.rvecs[ci], r.tvecs[ci]) + offset
+            cam.est_x, cam.est_y, cam.est_z = float(center[0]), float(center[1]), float(center[2])
+    ctx.log(f"Bundle adjustment: reprojection RMSE {r.rmse_before:.3f} -> "
+            f"{r.rmse_after:.3f} px over {r.n_obs} observations.", "ok")
 
 
 def _georef_from_gps(ctx, ch, tf, georef):
