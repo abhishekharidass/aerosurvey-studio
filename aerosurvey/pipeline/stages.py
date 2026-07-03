@@ -456,34 +456,41 @@ def _dense_simulated(ctx: StageContext) -> bool:
     return True
 
 
+def _classify_cell(P) -> float:
+    """Ground-filter cell size: ~1 m for typical drone extents, larger for big areas."""
+    minx, miny, maxx, maxy = _extent(P)
+    span = max(maxx - minx, maxy - miny, 1.0)
+    return min(max(span / 500.0, 1.0), 3.0)
+
+
 def run_classify(ctx: StageContext) -> bool:
+    from . import classify
     path = ctx.chunk.outputs.dense_cloud
     if not path or not os.path.exists(path):
         ctx.log("No dense cloud to classify. Run 'Build Dense Cloud' first.", "error")
         return False
-    ctx.log("Classifying points (ground filter + height/colour rules)...", "info")
-    P, C, _ = _load_cloud(path)
-    if not ctx.sleep(0.5):
-        return False
-    # Ground surface = min Z on a coarse grid over the actual extent
-    cell = 5.0
-    minx, miny, maxx, maxy = _extent(P)
-    nx = max(int(np.ceil((maxx - minx) / cell)) + 1, 1)
-    ny = max(int(np.ceil((maxy - miny) / cell)) + 1, 1)
-    ix, iy = _cell_indices(P, minx, maxy, cell, nx, ny)
-    key = iy * nx + ix
-    ground = np.full(nx * ny, np.inf)
-    np.minimum.at(ground, key, P[:, 2])
-    height = P[:, 2] - ground[key]
-    cls = np.ones(len(P), np.uint8)
-    cls[height < 0.6] = 2                       # ground
-    non = height >= 0.6
-    green = (C[:, 1].astype(int) > C[:, 0].astype(int) + 12) & \
-            (C[:, 1].astype(int) > C[:, 2].astype(int) + 12)
-    cls[non & green] = 5                         # high vegetation
-    cls[non & ~green] = 6                        # building
-    ctx.progress(70)
     out = os.path.join(ctx.workdir, "classified_cloud.las")
+
+    if classify.pdal_available():
+        ctx.log("Classifying with PDAL (SMRF ground filter + HAG)...", "info")
+        if classify.pdal_classify(path, out):
+            ctx.chunk.outputs.classified_cloud = out
+            _, _, cls = _load_cloud(out)
+            counts = {int(k): int((cls == k).sum()) for k in np.unique(cls)}
+            ctx.log(f"Classified (PDAL): {counts} -> {out}", "ok")
+            ctx.progress(100)
+            return True
+        ctx.log("PDAL pipeline failed; falling back to built-in classifier.", "warn")
+
+    ctx.log("Classifying (progressive morphological ground filter + roughness split)...",
+            "info")
+    P, C, _ = _load_cloud(path)
+    if not ctx.sleep(0.2):
+        return False
+    cls = classify.classify_cloud(P, C, cell=_classify_cell(P))
+    if ctx.cancelled:
+        return False
+    ctx.progress(85)
     _write_las(out, P, C, cls)
     ctx.chunk.outputs.classified_cloud = out
     counts = {int(k): int((cls == k).sum()) for k in np.unique(cls)}

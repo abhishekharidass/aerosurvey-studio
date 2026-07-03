@@ -109,8 +109,11 @@ with a `subprocess` call to the real engine and parse its result:
   (max-Z / ground min-Z / nadir RGB) writing LZW GeoTIFFs with the project EPSG and
   a proper geotransform — so they now produce correct output from *any* real
   georeferenced cloud, not just the synthetic domain.
-- **classify** → *still simulated* (height + colour heuristic). Next to wire: a PDAL
-  pipeline (`filters.smrf` / `filters.csf` ground filter, then class assignment).
+- **classify** → **✅ wired** ([`pipeline/classify.py`](aerosurvey/pipeline/classify.py)):
+  a real progressive morphological ground filter (scipy) + KDTree local-roughness
+  to split non-ground into building (planar) vs vegetation (rough), colour as a
+  tie-breaker; ~98% accuracy on the synthetic scene. Uses a PDAL `filters.smrf`
+  pipeline instead when the PDAL CLI is on PATH.
 
 `engines.py` already reports which of these are present on the machine
 (**Tools ▸ Processing Engines**), so a stage can choose engine-vs-simulation at
