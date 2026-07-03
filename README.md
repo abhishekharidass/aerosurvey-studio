@@ -101,10 +101,16 @@ with a `subprocess` call to the real engine and parse its result:
   (fallback), and reports control/check residuals (shown in the Reference panel's
   *Error (m)* column). *Still to do:* full GCP-constrained bundle adjustment
   (currently a rigid similarity fit, not a re-solve of camera parameters).
-- **dense** → OpenMVS `DensifyPointCloud` (or COLMAP `patch_match_stereo` +
-  `stereo_fusion`).
-- **classify** → PDAL pipeline (`filters.smrf` / `filters.csf` for ground).
-- **dsm / dtm / ortho** → PDAL `writers.gdal` + GDAL `gdal_translate` / `gdalwarp`.
+- **dense** → **✅ wired** ([`pipeline/openmvs.py`](aerosurvey/pipeline/openmvs.py)):
+  runs COLMAP `image_undistorter` → OpenMVS `InterfaceCOLMAP` → `DensifyPointCloud`,
+  reads the dense PLY (Open3D) and carries it into the project CRS via the georef
+  transform. Falls back to the simulation when OpenMVS isn't on PATH.
+- **dsm / dtm / ortho** → **✅ real rasterisers** (rasterio): extent-aware gridding
+  (max-Z / ground min-Z / nadir RGB) writing LZW GeoTIFFs with the project EPSG and
+  a proper geotransform — so they now produce correct output from *any* real
+  georeferenced cloud, not just the synthetic domain.
+- **classify** → *still simulated* (height + colour heuristic). Next to wire: a PDAL
+  pipeline (`filters.smrf` / `filters.csf` ground filter, then class assignment).
 
 `engines.py` already reports which of these are present on the machine
 (**Tools ▸ Processing Engines**), so a stage can choose engine-vs-simulation at

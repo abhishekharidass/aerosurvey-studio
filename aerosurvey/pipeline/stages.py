@@ -116,18 +116,41 @@ def _write_las(path: str, P: np.ndarray, C: np.ndarray, cls: np.ndarray) -> None
     las.write(path)
 
 
-def _grid(P, values, cell=1.0, reducer="max"):
-    """Rasterise scattered points to a regular grid. Returns (arr, transform_origin)."""
-    nx = ny = int(DOMAIN / cell)
-    ix = np.clip(((P[:, 0]) / cell).astype(int), 0, nx - 1)
-    iy = np.clip(((P[:, 1]) / cell).astype(int), 0, ny - 1)
+def _extent(P):
+    """(minx, miny, maxx, maxy) of a point set."""
+    return (float(P[:, 0].min()), float(P[:, 1].min()),
+            float(P[:, 0].max()), float(P[:, 1].max()))
+
+
+def _cell_indices(P, minx, maxy, cell, nx, ny):
+    """Column/row indices for each point (row 0 = north/top)."""
+    ix = np.clip(((P[:, 0] - minx) / cell).astype(int), 0, nx - 1)
+    iy = np.clip(((maxy - P[:, 1]) / cell).astype(int), 0, ny - 1)
+    return ix, iy
+
+
+def _grid(P, values, cell, reducer="max"):
+    """Rasterise scattered points over their own extent. Returns (arr, (minx, maxy), nx, ny)."""
+    minx, miny, maxx, maxy = _extent(P)
+    nx = max(int(np.ceil((maxx - minx) / cell)) + 1, 1)
+    ny = max(int(np.ceil((maxy - miny) / cell)) + 1, 1)
+    ix, iy = _cell_indices(P, minx, maxy, cell, nx, ny)
     arr = np.full((ny, nx), np.nan, np.float32)
-    # row 0 = top (north) so flip Y
-    row = ny - 1 - iy
+    # ascending sort -> largest written last (max); reverse for min. Last write wins.
     order = np.argsort(values) if reducer == "max" else np.argsort(-values)
-    for r, c, v in zip(row[order], ix[order], values[order]):
-        arr[r, c] = v  # last write wins -> extreme value for chosen reducer
-    return arr, cell, nx, ny
+    arr[iy[order], ix[order]] = np.asarray(values, np.float32)[order]
+    return arr, (minx, maxy), nx, ny
+
+
+def _raster_cell(P, target_px=1000, min_cell=0.02):
+    """Pick a ground sample distance so the longer side is ~target_px cells."""
+    minx, miny, maxx, maxy = _extent(P)
+    span = max(maxx - minx, maxy - miny, 1.0)
+    return max(span / target_px, min_cell)
+
+
+def _dsm_cell(P):
+    return _raster_cell(P, target_px=800)
 
 
 def _fill_nan(arr: np.ndarray) -> np.ndarray:
@@ -158,22 +181,23 @@ def _fill_nan(arr: np.ndarray) -> np.ndarray:
     return out
 
 
-def _write_geotiff(path, arr, chunk: Chunk, bands=1, cell=1.0):
+def _write_geotiff(path, arr, chunk: Chunk, origin, cell):
+    """Write a float32 GeoTIFF. origin = (minx, maxy) top-left corner."""
     import rasterio
     from rasterio.transform import from_origin
-    epsg = chunk.epsg
     crs = None
-    if epsg:
+    if chunk.epsg:
         try:
-            crs = rasterio.crs.CRS.from_epsg(epsg)
+            crs = rasterio.crs.CRS.from_epsg(chunk.epsg)
         except Exception:
             crs = None
-    transform = from_origin(0, DOMAIN, cell, cell)
+    minx, maxy = origin
+    transform = from_origin(minx, maxy, cell, cell)
     if arr.ndim == 2:
         arr = arr[np.newaxis, :, :]
     profile = dict(driver="GTiff", height=arr.shape[1], width=arr.shape[2],
                    count=arr.shape[0], dtype="float32", crs=crs, transform=transform,
-                   compress="lzw", nodata=(np.nan if bands == 1 else None))
+                   compress="lzw", nodata=(np.nan if arr.shape[0] == 1 else None))
     with rasterio.open(path, "w", **profile) as dst:
         dst.write(arr.astype(np.float32))
 
@@ -309,6 +333,7 @@ def run_georef(ctx: StageContext) -> bool:
         _transform_las(ch.outputs.sparse_cloud, sim)
         ctx.log("Sparse cloud transformed into project CRS.", "info")
 
+    ch._georef_sim = sim  # transient: applied to the dense cloud (still local on disk)
     ch.optimized = True
     ctx.progress(100)
     return True
@@ -374,9 +399,47 @@ def _georef_from_gcps(ctx, ch, res, georef):
 
 
 def run_dense(ctx: StageContext) -> bool:
-    if not ctx.chunk.aligned:
+    """Dense reconstruction. Uses OpenMVS if installed (with a COLMAP result),
+    else the built-in simulation."""
+    from . import colmap, openmvs
+    ch = ctx.chunk
+    if not ch.aligned:
         ctx.log("Cameras are not aligned. Run 'Align Photos' first.", "error")
         return False
+    res = getattr(ch, "_colmap_result", None)
+    if openmvs.available() and colmap.available() and res is not None and res.model_dir:
+        return _dense_openmvs(ctx, res, colmap, openmvs)
+    if res is None or not colmap.available():
+        ctx.log("No real reconstruction available — using built-in simulation for the "
+                "dense cloud.", "warn")
+    else:
+        ctx.log("OpenMVS not found on PATH — using built-in simulation for the dense "
+                "cloud.", "warn")
+    return _dense_simulated(ctx)
+
+
+def _dense_openmvs(ctx: StageContext, res, colmap, openmvs) -> bool:
+    ctx.log(f"Dense multi-view stereo via OpenMVS ({openmvs.densify_exe()})...", "info")
+    ply = openmvs.run_dense(res.model_dir, res.image_dir, ctx.workdir, ctx, colmap.exe())
+    if ply is None:
+        return False
+    P, C = openmvs.load_ply(ply)
+    if len(P) == 0:
+        ctx.log("OpenMVS dense cloud is empty.", "error")
+        return False
+    sim = getattr(ctx.chunk, "_georef_sim", None)
+    if sim is not None:
+        P = sim.apply(P)  # carry local dense cloud into the project CRS
+        ctx.log("Dense cloud transformed into project CRS.", "info")
+    out = os.path.join(ctx.workdir, "dense_cloud.las")
+    _write_las(out, P, C, np.ones(len(P), np.uint8))
+    ctx.chunk.outputs.dense_cloud = out
+    ctx.log(f"Dense cloud: {len(P):,} points -> {out}", "ok")
+    ctx.progress(100)
+    return True
+
+
+def _dense_simulated(ctx: StageContext) -> bool:
     ctx.log("Computing per-pixel depth maps (Multi-View Stereo)...", "info")
     if not ctx.sleep(1.0):
         return False
@@ -385,10 +448,8 @@ def run_dense(ctx: StageContext) -> bool:
     P, C, K = _synth_scene()
     if not ctx.sleep(0.6):
         return False
-    # store unclassified initially
-    K0 = np.ones_like(K)  # class 1 = unclassified
     out = os.path.join(ctx.workdir, "dense_cloud.las")
-    _write_las(out, P, C, K0)
+    _write_las(out, P, C, np.ones_like(K))  # class 1 = unclassified
     ctx.chunk.outputs.dense_cloud = out
     ctx.progress(100)
     ctx.log(f"Dense cloud: {len(P):,} points -> {out}", "ok")
@@ -404,13 +465,14 @@ def run_classify(ctx: StageContext) -> bool:
     P, C, _ = _load_cloud(path)
     if not ctx.sleep(0.5):
         return False
-    # Ground surface = min Z on a coarse grid
+    # Ground surface = min Z on a coarse grid over the actual extent
     cell = 5.0
-    nx = int(DOMAIN / cell)
-    ix = np.clip((P[:, 0] / cell).astype(int), 0, nx - 1)
-    iy = np.clip((P[:, 1] / cell).astype(int), 0, nx - 1)
+    minx, miny, maxx, maxy = _extent(P)
+    nx = max(int(np.ceil((maxx - minx) / cell)) + 1, 1)
+    ny = max(int(np.ceil((maxy - miny) / cell)) + 1, 1)
+    ix, iy = _cell_indices(P, minx, maxy, cell, nx, ny)
     key = iy * nx + ix
-    ground = np.full(nx * nx, np.inf)
+    ground = np.full(nx * ny, np.inf)
     np.minimum.at(ground, key, P[:, 2])
     height = P[:, 2] - ground[key]
     cls = np.ones(len(P), np.uint8)
@@ -442,14 +504,15 @@ def run_dsm(ctx: StageContext) -> bool:
         return False
     ctx.log("Rasterising DSM (max Z per cell)...", "info")
     P, _, _ = _load_cloud(path)
-    arr, cell, nx, ny = _grid(P, P[:, 2], cell=1.0, reducer="max")
+    cell = _dsm_cell(P)
+    arr, origin, nx, ny = _grid(P, P[:, 2], cell=cell, reducer="max")
     arr = _fill_nan(arr)
     if not ctx.sleep(0.4):
         return False
     out = os.path.join(ctx.workdir, "dsm.tif")
-    _write_geotiff(out, arr, ctx.chunk, bands=1, cell=cell)
+    _write_geotiff(out, arr, ctx.chunk, origin, cell)
     ctx.chunk.outputs.dsm = out
-    ctx.log(f"DSM {nx}x{ny} @ {cell} m -> {out}", "ok")
+    ctx.log(f"DSM {nx}x{ny} @ {cell:.3f} m -> {out}", "ok")
     ctx.progress(100)
     return True
 
@@ -465,14 +528,15 @@ def run_dtm(ctx: StageContext) -> bool:
     if len(ground) == 0:
         ctx.log("No ground points found.", "error")
         return False
-    arr, cell, nx, ny = _grid(ground, ground[:, 2], cell=1.0, reducer="min")
+    cell = _dsm_cell(P)
+    arr, origin, nx, ny = _grid(ground, ground[:, 2], cell=cell, reducer="min")
     arr = _fill_nan(arr)
     if not ctx.sleep(0.4):
         return False
     out = os.path.join(ctx.workdir, "dtm.tif")
-    _write_geotiff(out, arr, ctx.chunk, bands=1, cell=cell)
+    _write_geotiff(out, arr, ctx.chunk, origin, cell)
     ctx.chunk.outputs.dtm = out
-    ctx.log(f"DTM {nx}x{ny} @ {cell} m -> {out}", "ok")
+    ctx.log(f"DTM {nx}x{ny} @ {cell:.3f} m -> {out}", "ok")
     ctx.progress(100)
     return True
 
@@ -484,25 +548,24 @@ def run_ortho(ctx: StageContext) -> bool:
         return False
     ctx.log("Projecting images onto DSM and mosaicking (nadir seamlines)...", "info")
     P, C, _ = _load_cloud(path)
-    cell = 0.5
-    nx = ny = int(DOMAIN / cell)
-    ix = np.clip((P[:, 0] / cell).astype(int), 0, nx - 1)
-    iy = np.clip((P[:, 1] / cell).astype(int), 0, ny - 1)
-    row = ny - 1 - iy
+    cell = _raster_cell(P, target_px=1600)
+    minx, miny, maxx, maxy = _extent(P)
+    nx = max(int(np.ceil((maxx - minx) / cell)) + 1, 1)
+    ny = max(int(np.ceil((maxy - miny) / cell)) + 1, 1)
+    ix, iy = _cell_indices(P, minx, maxy, cell, nx, ny)
     order = np.argsort(P[:, 2])  # highest last -> top surface wins
     rgb = np.zeros((3, ny, nx), np.float32)
     for b in range(3):
         band = np.full((ny, nx), np.nan, np.float32)
-        for r, c, v in zip(row[order], ix[order], C[order, b].astype(np.float32)):
-            band[r, c] = v
+        band[iy[order], ix[order]] = C[order, b].astype(np.float32)
         rgb[b] = _fill_nan(band)
         if not ctx.sleep(0.15):
             return False
         ctx.progress(30 + b * 20)
     out = os.path.join(ctx.workdir, "orthomosaic.tif")
-    _write_geotiff(out, rgb, ctx.chunk, bands=3, cell=cell)
+    _write_geotiff(out, rgb, ctx.chunk, (minx, maxy), cell)
     ctx.chunk.outputs.orthomosaic = out
-    ctx.log(f"Orthomosaic {nx}x{ny} @ {cell} m (3-band RGB) -> {out}", "ok")
+    ctx.log(f"Orthomosaic {nx}x{ny} @ {cell:.3f} m (3-band RGB) -> {out}", "ok")
     ctx.progress(100)
     return True
 

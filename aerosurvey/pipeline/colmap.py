@@ -66,6 +66,8 @@ class ColmapResult:
     points: np.ndarray = field(default_factory=lambda: np.zeros((0, 3)))
     colors: np.ndarray = field(default_factory=lambda: np.zeros((0, 3), np.uint8))
     mean_reproj_error: float = 0.0
+    model_dir: str = ""   # sparse model folder (for downstream OpenMVS)
+    image_dir: str = ""   # staged image folder
 
     def projection(self, pose: "CameraPose"):
         """3x4 projection matrix for a pose, or None if intrinsics are unknown."""
@@ -268,4 +270,7 @@ def run_sfm(image_paths: List[str], workdir: str, ctx, use_gpu: bool = False) ->
             return None
 
     ctx.progress(95)
-    return read_model_dir(model)
+    result = read_model_dir(model)
+    result.model_dir = model
+    result.image_dir = img_dir
+    return result
