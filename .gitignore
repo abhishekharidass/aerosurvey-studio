@@ -22,3 +22,8 @@ env/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Run outputs, generated decks, stray engine logs
+runs/
+*.pptx
+InterfaceCOLMAP-*.log
