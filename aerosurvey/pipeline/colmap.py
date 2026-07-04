@@ -112,7 +112,8 @@ def parse_images_txt(path: str):
         qvec = np.array(list(map(float, parts[1:5])))
         tvec = np.array(list(map(float, parts[5:8])))
         camera_id = int(parts[8])
-        name = os.path.basename(parts[9])
+        # NAME is everything after the 9 numeric fields; it may contain spaces.
+        name = os.path.basename(" ".join(parts[9:]))
         poses[name] = CameraPose(name, qvec, tvec, camera_center(qvec, tvec), camera_id)
         toks = pts_line.split()
         for j in range(0, len(toks) - 2, 3):
@@ -263,6 +264,22 @@ def run_sfm(image_paths: List[str], workdir: str, ctx, use_gpu: bool = False) ->
     img_dir = _stage_images(image_paths, os.path.join(col_dir, "images"))
     sparse = os.path.join(col_dir, "sparse")
     os.makedirs(sparse, exist_ok=True)
+
+    # Resume: if a reconstruction already exists, reuse it instead of recomputing.
+    existing = _largest_model(sparse)
+    if existing is not None:
+        ctx.log(f"Reusing existing COLMAP reconstruction at {existing}.", "info")
+        if not os.path.exists(os.path.join(existing, "images.txt")):
+            if _run_step("model_converter", ["model_converter", "--input_path", existing,
+                                             "--output_path", existing,
+                                             "--output_type", "TXT"], ctx) is not True:
+                return None
+        result = read_model_dir(existing)
+        result.model_dir = existing
+        result.image_dir = img_dir
+        ctx.progress(100)
+        return result
+
     gpu = "1" if use_gpu else "0"
 
     # COLMAP 4.x renamed the SIFT option groups.

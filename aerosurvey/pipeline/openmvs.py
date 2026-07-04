@@ -91,8 +91,11 @@ def run_dense(colmap_model_dir: str, image_dir: str, workdir: str, ctx,
         return None
     ctx.progress(45)
 
-    if _run([densify_exe(), scene, "-o", "scene_dense.mvs", "-w", mvs],
-            "DensifyPointCloud", ctx) is not True:
+    dens = [densify_exe(), scene, "-o", "scene_dense.mvs", "-w", mvs]
+    rl = os.environ.get("AEROSURVEY_MVS_RESOLUTION_LEVEL")
+    if rl:  # higher = more downsampling = faster/coarser dense cloud
+        dens += ["--resolution-level", str(rl)]
+    if _run(dens, "DensifyPointCloud", ctx) is not True:
         return None
     ctx.progress(85)
 
