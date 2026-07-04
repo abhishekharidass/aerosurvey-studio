@@ -12,6 +12,7 @@ parsers are unit-testable without COLMAP present.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -26,6 +27,18 @@ def exe() -> str:
 
 def available() -> bool:
     return bool(exe())
+
+
+def version_major() -> int:
+    """Major COLMAP version (4.x renamed SiftExtraction/SiftMatching option groups)."""
+    try:
+        out = subprocess.run([exe(), "help"], capture_output=True, text=True, timeout=20)
+        m = re.search(r"COLMAP\s+(\d+)\.", (out.stdout or "") + (out.stderr or ""))
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    return 3
 
 
 # ---------------------------------------------------------------------------
@@ -252,13 +265,18 @@ def run_sfm(image_paths: List[str], workdir: str, ctx, use_gpu: bool = False) ->
     os.makedirs(sparse, exist_ok=True)
     gpu = "1" if use_gpu else "0"
 
+    # COLMAP 4.x renamed the SIFT option groups.
+    major = version_major()
+    feat = "FeatureExtraction" if major >= 4 else "SiftExtraction"
+    match = "FeatureMatching" if major >= 4 else "SiftMatching"
+
     steps = [
         ("feature_extractor", ["feature_extractor", "--database_path", db,
                                "--image_path", img_dir,
                                "--ImageReader.single_camera", "1",
-                               "--SiftExtraction.use_gpu", gpu], 25),
+                               f"--{feat}.use_gpu", gpu], 25),
         ("exhaustive_matcher", ["exhaustive_matcher", "--database_path", db,
-                                "--SiftMatching.use_gpu", gpu], 55),
+                                f"--{match}.use_gpu", gpu], 55),
         ("mapper", ["mapper", "--database_path", db, "--image_path", img_dir,
                     "--output_path", sparse], 85),
     ]
