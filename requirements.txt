@@ -11,6 +11,7 @@ pyproj>=3.5        # coordinate reference transforms (UTM / EPSG)
 rasterio>=1.3      # GeoTIFF DSM/DTM/orthomosaic I/O
 laspy>=2.5         # LAS/LAZ point clouds
 open3d>=0.17       # interactive 3D point-cloud viewer
+scikit-learn>=1.3  # trained Random Forest point-cloud classifier (+ joblib)
 
 # --- External engines (not pip-installable; detected on PATH if present) ---
 #   COLMAP     https://colmap.github.io/           feature matching + SfM/AT

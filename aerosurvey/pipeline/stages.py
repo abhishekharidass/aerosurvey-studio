@@ -561,7 +561,7 @@ def _classify_cell(P) -> float:
 
 
 def run_classify(ctx: StageContext) -> bool:
-    from . import classify
+    from . import classify, ml_classify
     path = ctx.chunk.outputs.dense_cloud
     if not path or not os.path.exists(path):
         ctx.log("No dense cloud to classify. Run 'Build Dense Cloud' first.", "error")
@@ -579,12 +579,16 @@ def run_classify(ctx: StageContext) -> bool:
             return True
         ctx.log("PDAL pipeline failed; falling back to built-in classifier.", "warn")
 
-    ctx.log("Classifying (progressive morphological ground filter + roughness split)...",
-            "info")
     P, C, _ = _load_cloud(path)
     if not ctx.sleep(0.2):
         return False
-    cls = classify.classify_cloud(P, C, cell=_classify_cell(P))
+    if os.environ.get("AEROSURVEY_USE_ML_CLASSIFIER") and ml_classify.available():
+        ctx.log("Classifying with the trained Random Forest model...", "info")
+        cls = ml_classify.classify(P, C)
+    else:
+        ctx.log("Classifying (progressive morphological ground filter + roughness split)...",
+                "info")
+        cls = classify.classify_cloud(P, C, cell=_classify_cell(P))
     if ctx.cancelled:
         return False
     ctx.progress(85)

@@ -122,6 +122,13 @@ with a `subprocess` call to the real engine and parse its result:
   to split non-ground into building (planar) vs vegetation (rough), colour as a
   tie-breaker; ~98% accuracy on the synthetic scene. Uses a PDAL `filters.smrf`
   pipeline instead when the PDAL CLI is on PATH.
+- **classify (ML)** → **✅ wired** ([`pipeline/ml_classify.py`](aerosurvey/pipeline/ml_classify.py)):
+  a trained **Random Forest** on 9 per-point geometric + radiometric features
+  (height-above-ground, planarity/linearity/sphericity, surface-variation,
+  verticality, height-range, greenness, brightness). 99.7% held-out accuracy on
+  labelled data; retrain with `python tools/train_classifier.py`. Opt-in via
+  `AEROSURVEY_USE_ML_CLASSIFIER=1` (the rule-based filter is the default, as the
+  synthetic-trained model still shows a domain gap on real MVS clouds).
 
 `engines.py` already reports which of these are present on the machine
 (**Tools ▸ Processing Engines**), so a stage can choose engine-vs-simulation at
