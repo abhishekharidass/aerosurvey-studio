@@ -24,7 +24,9 @@ stages one module at a time (see *Wiring real engines* below).
 | **Coordinate systems** | Local / arbitrary, WGS84 UTM (auto zone from geotags), explicit EPSG — via `pyproj` |
 | **Photos** | List, sort by name / capture time / **proximity to a selected GCP** |
 | **GCPs** | Add / edit / remove, import from CSV (`label,x,y,z[,type]`), control vs check points |
-| **GCP marking** | Zoom, pan, **click to place**, **drag to move**, **right-click / Delete to remove** markers; every GCP shown per image, active one highlighted; live pixel readout |
+| **GCP marking** | Zoom, pan, **click to place**, **drag to move**, **arrow-key sub-pixel nudge** (Shift = 0.2 px), **right-click / Delete to remove**; every GCP shown per image, active one highlighted; live pixel readout |
+| **Vertical datum** | Ellipsoidal (GPS) or **orthometric / MSL** heights via geoid separation N (manual or EGM2008 auto); applied to DSM/DTM |
+| **Processing report** | One-click **Pix4D-style HTML quality report** — summary, alignment & georeferencing quality, GCP accuracy table, classification, output specs, embedded ortho/DSM/camera-map thumbnails ([`report.py`](aerosurvey/report.py)) |
 | **Pipeline** | Align → **Optimize/Georeference** → Dense cloud → Classify → DSM → DTM → Orthomosaic, on a background thread with progress + cancel + console log |
 | **Georeferencing** | 7-param similarity fit into the project CRS from camera GPS, or from triangulated GCP marks (control/check split); per-GCP residual + control/check RMSE reported ([`pipeline/georef.py`](aerosurvey/pipeline/georef.py)) |
 | **Bundle adjustment** | Sparse LM bundle adjustment (scipy) re-solving camera poses + tie points against GCP control, minimising reprojection error ([`pipeline/bundle.py`](aerosurvey/pipeline/bundle.py)) |

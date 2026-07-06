@@ -62,5 +62,27 @@ class CrsTransform:
         return (x, y, alt)
 
 
+def geoid_separation(lon: float, lat: float, ellip_h: float = 0.0) -> Optional[float]:
+    """Geoid undulation N = ellipsoidal - orthometric height, via EGM2008 (EPSG:3855).
+
+    Returns None if pyproj/geoid grids are unavailable (offline) — the caller then
+    falls back to a manually entered N. Attempts to enable the PROJ grid network.
+    """
+    if not _HAS_PYPROJ:
+        return None
+    try:
+        import pyproj
+        try:
+            pyproj.network.set_network_enabled(True)
+        except Exception:
+            pass
+        t = Transformer.from_crs("EPSG:4979", "EPSG:4326+3855", always_xy=True)
+        _, _, ortho = t.transform(lon, lat, ellip_h)
+        n = ellip_h - ortho
+        return float(n) if abs(n) > 1e-6 else None   # None => grid missing (no shift)
+    except Exception:
+        return None
+
+
 def pyproj_available() -> bool:
     return _HAS_PYPROJ

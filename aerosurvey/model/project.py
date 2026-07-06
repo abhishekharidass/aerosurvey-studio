@@ -33,12 +33,17 @@ class Chunk:
     crs_mode: str = "local"
     epsg: Optional[int] = None          # explicit EPSG when crs_mode == "epsg"/"utm"
     crs_label: str = "Local coordinates (arbitrary)"
+    # Vertical datum: "ellipsoidal" (raw GPS height) or "orthometric" (MSL).
+    # Orthometric = ellipsoidal - geoid_separation (N).
+    vertical_datum: str = "ellipsoidal"
+    geoid_separation: float = 0.0
 
     # Pipeline status flags
     aligned: bool = False
     optimized: bool = False
 
     outputs: Outputs = field(default_factory=Outputs)
+    stats: dict = field(default_factory=dict)   # processing metrics for the report
 
     _next_cam_id: int = 1
     _next_gcp_id: int = 1
@@ -77,11 +82,14 @@ class Chunk:
             "crs_mode": self.crs_mode,
             "epsg": self.epsg,
             "crs_label": self.crs_label,
+            "vertical_datum": self.vertical_datum,
+            "geoid_separation": self.geoid_separation,
             "aligned": self.aligned,
             "optimized": self.optimized,
             "next_cam_id": self._next_cam_id,
             "next_gcp_id": self._next_gcp_id,
             "outputs": self.outputs.__dict__,
+            "stats": self.stats,
             "cameras": [c.__dict__ for c in self.cameras],
             "gcps": [
                 {
@@ -98,11 +106,14 @@ class Chunk:
         ch.crs_mode = d.get("crs_mode", "local")
         ch.epsg = d.get("epsg")
         ch.crs_label = d.get("crs_label", "Local coordinates (arbitrary)")
+        ch.vertical_datum = d.get("vertical_datum", "ellipsoidal")
+        ch.geoid_separation = d.get("geoid_separation", 0.0)
         ch.aligned = d.get("aligned", False)
         ch.optimized = d.get("optimized", False)
         ch._next_cam_id = d.get("next_cam_id", 1)
         ch._next_gcp_id = d.get("next_gcp_id", 1)
         ch.outputs = Outputs(**d.get("outputs", {}))
+        ch.stats = d.get("stats", {})
         for cd in d.get("cameras", []):
             ch.cameras.append(Camera(**cd))
         for gd in d.get("gcps", []):

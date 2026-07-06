@@ -88,15 +88,20 @@ class AppState(QObject):
         self.log.emit(f"Saved project: {path}", "ok")
 
     # -- coordinate system ----------------------------------------------
-    def set_crs(self, mode: str, epsg: Optional[int]) -> None:
+    def set_crs(self, mode: str, epsg: Optional[int],
+                vertical_datum: str = "ellipsoidal", geoid_separation: float = 0.0) -> None:
         ch = self.chunk
         ch.crs_mode = mode
         ch.epsg = epsg
         ch.crs_label = crsmod.describe(epsg) if mode != "local" else "Local coordinates (arbitrary)"
+        ch.vertical_datum = vertical_datum
+        ch.geoid_separation = geoid_separation
         self._reproject_cameras()
         self.set_dirty()
         self.project_changed.emit()
         self.log.emit(f"Coordinate system: {ch.crs_label}", "info")
+        if vertical_datum == "orthometric":
+            self.log.emit(f"Vertical datum: orthometric (geoid N = {geoid_separation:.3f} m)", "info")
 
     def auto_utm_from_photos(self) -> Optional[int]:
         for c in self.chunk.cameras:

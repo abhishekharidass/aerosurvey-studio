@@ -9,7 +9,7 @@ Capabilities (the core GCP-marking requirement):
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (QBrush, QColor, QFont, QPainter, QPen, QPixmap)
 from PySide6.QtWidgets import (QGraphicsItem, QGraphicsPixmapItem, QGraphicsScene,
                                QGraphicsView, QHBoxLayout, QLabel, QMenu,
@@ -86,6 +86,8 @@ class MarkerItem(QGraphicsItem):
 
 
 class ImageCanvas(QGraphicsView):
+    marker_info = Signal(str)   # readout for the selected marker
+
     def __init__(self, state):
         super().__init__()
         self.state = state
@@ -95,6 +97,8 @@ class ImageCanvas(QGraphicsView):
         self.setTransformationAnchor(QGraphicsView.NoAnchor)
         self.setBackgroundBrush(QColor(BG_INPUT))
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.scene_obj.selectionChanged.connect(self._on_selection)
 
         self.pix_item: QGraphicsPixmapItem | None = None
         self.pixmap_size = QPixmap().size()
@@ -235,12 +239,48 @@ class ImageCanvas(QGraphicsView):
             return
         super().mouseReleaseEvent(event)
 
+    def _selected_marker(self):
+        for it in self.scene_obj.selectedItems():
+            if isinstance(it, MarkerItem):
+                return it
+        return None
+
+    def _on_selection(self):
+        m = self._selected_marker()
+        if m is not None:
+            p = m.pos()
+            self.marker_info.emit(f"{m.gcp.label}: x={p.x():.2f}  y={p.y():.2f}  "
+                                  "(arrows nudge · Shift = 0.2 px)")
+        else:
+            self.marker_info.emit("")
+
+    def nudge_marker(self, m: MarkerItem, dx: float, dy: float) -> None:
+        w, h = self.pixmap_size.width(), self.pixmap_size.height()
+        nx = min(max(m.pos().x() + dx, 0.0), float(w))
+        ny = min(max(m.pos().y() + dy, 0.0), float(h))
+        m._suppress = True
+        m.setPos(nx, ny)
+        m._suppress = False
+        # update the model in place without a rebuild (keeps the marker selected)
+        g = self.state.chunk.gcp(m.gcp.id)
+        if g is not None:
+            g.mark(m.cam_id, nx, ny)
+            self.state.set_dirty()
+        self.marker_info.emit(f"{m.gcp.label}: x={nx:.2f}  y={ny:.2f}  "
+                              "(arrows nudge · Shift = 0.2 px)")
+
     def keyPressEvent(self, event):
+        m = self._selected_marker()
         if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
-            for it in self.scene_obj.selectedItems():
-                if isinstance(it, MarkerItem):
-                    self.remove_marker(it)
-                    return
+            if m is not None:
+                self.remove_marker(m)
+                return
+        elif event.key() in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down) and m is not None:
+            step = 0.2 if (event.modifiers() & Qt.ShiftModifier) else 1.0
+            dx = -step if event.key() == Qt.Key_Left else step if event.key() == Qt.Key_Right else 0.0
+            dy = -step if event.key() == Qt.Key_Up else step if event.key() == Qt.Key_Down else 0.0
+            self.nudge_marker(m, dx, dy)
+            return
         elif event.key() == Qt.Key_F:
             self.fit()
         super().keyPressEvent(event)
@@ -279,10 +319,17 @@ class ImageView(QWidget):
         self.canvas = ImageCanvas(state)
         lay.addWidget(self.canvas, 1)
 
-        hint = QLabel("  Left-click: place active GCP   ·   drag marker: move   ·   "
-                      "right-click / Delete: remove   ·   wheel: zoom   ·   middle-drag: pan")
+        readout_row = QHBoxLayout()
+        hint = QLabel("  Left-click: place · drag: move · arrows: nudge (Shift = 0.2 px) · "
+                      "right-click / Delete: remove · wheel: zoom · middle-drag: pan")
         hint.setStyleSheet(f"color: {FG_MUTED}; padding: 3px 6px;")
-        lay.addWidget(hint)
+        readout_row.addWidget(hint, 1)
+        self.marker_readout = QLabel("")
+        self.marker_readout.setStyleSheet(f"color: {ACCENT}; padding: 3px 8px; "
+                                          "font-family: Consolas, monospace;")
+        readout_row.addWidget(self.marker_readout)
+        lay.addLayout(readout_row)
+        self.canvas.marker_info.connect(self.marker_readout.setText)
 
         state.active_camera_changed.connect(self._update_title)
         state.active_gcp_changed.connect(self._update_gcp_label)

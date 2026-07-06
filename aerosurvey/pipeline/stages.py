@@ -153,6 +153,14 @@ def _dsm_cell(P):
     return _raster_cell(P, target_px=800)
 
 
+def _to_vertical(chunk, arr):
+    """Convert ellipsoidal heights to orthometric (MSL) by removing the geoid
+    separation N, when the chunk uses an orthometric vertical datum."""
+    if getattr(chunk, "vertical_datum", "ellipsoidal") == "orthometric" and chunk.geoid_separation:
+        return arr - float(chunk.geoid_separation)
+    return arr
+
+
 def _fill_nan(arr: np.ndarray) -> np.ndarray:
     """Cheap hole-fill by nearest finite neighbour via iterative dilation."""
     out = arr.copy()
@@ -260,6 +268,9 @@ def _align_colmap(ctx: StageContext, cams, colmap) -> bool:
         ctx.chunk.outputs.sparse_cloud = out
         ctx.log(f"Sparse cloud: {len(res.points):,} tie points -> {out}", "info")
 
+    ctx.chunk.stats.update({"cameras_total": len(cams), "cameras_aligned": matched,
+                            "mean_reproj_px": round(float(res.mean_reproj_error), 3),
+                            "sparse_points": int(len(res.points)), "align_engine": "COLMAP"})
     ctx.log(f"COLMAP aligned {matched}/{len(cams)} cameras "
             f"(mean reprojection error {res.mean_reproj_error:.3f} px).", "ok")
     ctx.log("Note: poses are in COLMAP's local frame; georeferencing to GCPs/GPS is a "
@@ -289,6 +300,9 @@ def _align_simulated(ctx: StageContext, cams) -> bool:
         cam.aligned = True
     ctx.chunk.aligned = True
     err = np.abs(rng.normal(0, 0.35, 4000))
+    ctx.chunk.stats.update({"cameras_total": len(cams), "cameras_aligned": len(cams),
+                            "mean_reproj_px": round(float(err.mean()), 3),
+                            "align_engine": "simulation"})
     ctx.log(f"Aligned {len(cams)} cameras. Mean reprojection error "
             f"{err.mean():.3f} px (Gaussian, sigma {err.std():.3f}).", "ok")
     ctx.progress(100)
@@ -428,6 +442,7 @@ def _refine_bundle(ctx: StageContext, ch, res, sim) -> None:
         if cam is not None:
             center = bundle.center_from_rt(r.rvecs[ci], r.tvecs[ci]) + offset
             cam.est_x, cam.est_y, cam.est_z = float(center[0]), float(center[1]), float(center[2])
+    ch.stats["ba_rmse_px"] = round(float(r.rmse_after), 3)
     ctx.log(f"Bundle adjustment: reprojection RMSE {r.rmse_before:.3f} -> "
             f"{r.rmse_after:.3f} px over {r.n_obs} observations.", "ok")
     if r.intrinsics is not None:
@@ -446,6 +461,7 @@ def _georef_from_gps(ctx, ch, tf, georef):
         return None
     sim = georef.umeyama_similarity(np.array(local), np.array(world))
     fit = georef.residuals(np.array(local), np.array(world), sim)
+    ch.stats.update({"georef_method": "Camera GPS", "georef_rmse_m": round(float(fit.rmse), 3)})
     ctx.log(f"GPS georeferencing from {len(local)} cameras: RMSE {fit.rmse:.3f} m "
             f"(X {fit.rmse_axis[0]:.3f}, Y {fit.rmse_axis[1]:.3f}, Z {fit.rmse_axis[2]:.3f}).",
             "ok")
@@ -486,10 +502,15 @@ def _georef_from_gcps(ctx, ch, res, georef):
     fit = georef.residuals(L, W, sim)
     for g, e in zip(labels, fit.per_point):
         g.error = float(e)
+    control_rmse = float(np.sqrt(np.mean(fit.per_point[ctrl] ** 2)))
+    ch.stats.update({"georef_method": "Ground Control Points", "gcp_control": len(control),
+                     "gcp_check": len(checks) - len(control),
+                     "control_rmse_m": round(control_rmse, 3)})
     ctx.log(f"GCP georeferencing: {len(control)} control, {len(checks) - len(control)} check. "
-            f"Control RMSE {np.sqrt(np.mean(fit.per_point[ctrl] ** 2)):.3f} m.", "ok")
+            f"Control RMSE {control_rmse:.3f} m.", "ok")
     check = np.array([i for i, chk in enumerate(checks) if chk], dtype=int)
     if len(check):
+        ch.stats["check_rmse_m"] = round(float(np.sqrt(np.mean(fit.per_point[check] ** 2))), 3)
         ctx.log(f"Independent check-point RMSE "
                 f"{np.sqrt(np.mean(fit.per_point[check] ** 2)):.3f} m.", "ok")
     return sim
@@ -531,6 +552,7 @@ def _dense_openmvs(ctx: StageContext, res, colmap, openmvs) -> bool:
     out = os.path.join(ctx.workdir, "dense_cloud.las")
     _write_las(out, P, C, np.ones(len(P), np.uint8))
     ctx.chunk.outputs.dense_cloud = out
+    ctx.chunk.stats["dense_points"] = int(len(P))
     ctx.log(f"Dense cloud: {len(P):,} points -> {out}", "ok")
     ctx.progress(100)
     return True
@@ -548,6 +570,7 @@ def _dense_simulated(ctx: StageContext) -> bool:
     out = os.path.join(ctx.workdir, "dense_cloud.las")
     _write_las(out, P, C, np.ones_like(K))  # class 1 = unclassified
     ctx.chunk.outputs.dense_cloud = out
+    ctx.chunk.stats["dense_points"] = int(len(P))
     ctx.progress(100)
     ctx.log(f"Dense cloud: {len(P):,} points -> {out}", "ok")
     return True
@@ -574,6 +597,7 @@ def run_classify(ctx: StageContext) -> bool:
             ctx.chunk.outputs.classified_cloud = out
             _, _, cls = _load_cloud(out)
             counts = {int(k): int((cls == k).sum()) for k in np.unique(cls)}
+            ctx.chunk.stats["class_counts"] = counts
             ctx.log(f"Classified (PDAL): {counts} -> {out}", "ok")
             ctx.progress(100)
             return True
@@ -595,6 +619,7 @@ def run_classify(ctx: StageContext) -> bool:
     _write_las(out, P, C, cls)
     ctx.chunk.outputs.classified_cloud = out
     counts = {int(k): int((cls == k).sum()) for k in np.unique(cls)}
+    ctx.chunk.stats["class_counts"] = counts
     ctx.log(f"Classified: {counts} -> {out}", "ok")
     ctx.progress(100)
     return True
@@ -614,12 +639,13 @@ def run_dsm(ctx: StageContext) -> bool:
     P, _, _ = _load_cloud(path)
     cell = _dsm_cell(P)
     arr, origin, nx, ny = _grid(P, P[:, 2], cell=cell, reducer="max")
-    arr = _fill_nan(arr)
+    arr = _to_vertical(ctx.chunk, _fill_nan(arr))
     if not ctx.sleep(0.4):
         return False
     out = os.path.join(ctx.workdir, "dsm.tif")
     _write_geotiff(out, arr, ctx.chunk, origin, cell)
     ctx.chunk.outputs.dsm = out
+    ctx.chunk.stats["dsm"] = {"w": nx, "h": ny, "gsd_m": round(cell, 3)}
     ctx.log(f"DSM {nx}x{ny} @ {cell:.3f} m -> {out}", "ok")
     ctx.progress(100)
     return True
@@ -638,12 +664,13 @@ def run_dtm(ctx: StageContext) -> bool:
         return False
     cell = _dsm_cell(P)
     arr, origin, nx, ny = _grid(ground, ground[:, 2], cell=cell, reducer="min")
-    arr = _fill_nan(arr)
+    arr = _to_vertical(ctx.chunk, _fill_nan(arr))
     if not ctx.sleep(0.4):
         return False
     out = os.path.join(ctx.workdir, "dtm.tif")
     _write_geotiff(out, arr, ctx.chunk, origin, cell)
     ctx.chunk.outputs.dtm = out
+    ctx.chunk.stats["dtm"] = {"w": nx, "h": ny, "gsd_m": round(cell, 3)}
     ctx.log(f"DTM {nx}x{ny} @ {cell:.3f} m -> {out}", "ok")
     ctx.progress(100)
     return True
@@ -673,6 +700,7 @@ def run_ortho(ctx: StageContext) -> bool:
     out = os.path.join(ctx.workdir, "orthomosaic.tif")
     _write_geotiff(out, rgb, ctx.chunk, (minx, maxy), cell)
     ctx.chunk.outputs.orthomosaic = out
+    ctx.chunk.stats["ortho"] = {"w": nx, "h": ny, "gsd_m": round(cell, 3)}
     ctx.log(f"Orthomosaic {nx}x{ny} @ {cell:.3f} m (3-band RGB) -> {out}", "ok")
     ctx.progress(100)
     return True

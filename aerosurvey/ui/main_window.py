@@ -92,6 +92,7 @@ class MainWindow(QMainWindow):
         self.act_import_photos = mk("Import Photos…", self.import_photos, "Ctrl+Shift+P")
         self.act_import_gcps = mk("Import GCPs…", self.import_gcps, "Ctrl+Shift+G")
         self.act_export = mk("Export Products…", self.export_products, "Ctrl+E")
+        self.act_report = mk("Generate Processing Report…", self.generate_report_action, "Ctrl+Shift+R")
         self.act_quit = mk("Exit", self.close, "Ctrl+Q")
 
         self.act_crs = mk("Set Coordinate System…", self.set_crs)
@@ -130,6 +131,7 @@ class MainWindow(QMainWindow):
             m_file.addAction(a)
         m_file.addSeparator()
         m_file.addAction(self.act_export)
+        m_file.addAction(self.act_report)
         m_file.addSeparator()
         m_file.addAction(self.act_quit)
 
@@ -280,6 +282,29 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Export",
                                 f"Exported {len(products)} product(s) to:\n{out}")
 
+    def generate_report_action(self):
+        from ..report import generate_report
+        ch = self.state.chunk
+        if not ch.stats and not ch.aligned:
+            QMessageBox.information(self, "Report",
+                                    "Run the workflow first — there is nothing to report yet.")
+            return
+        default = os.path.join(self.state.workdir(), f"{self.state.project.name}_report.html")
+        path, _ = QFileDialog.getSaveFileName(self, "Save Processing Report", default,
+                                              "HTML report (*.html)")
+        if not path:
+            return
+        try:
+            generate_report(ch, path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Report", f"Could not generate report:\n{exc}")
+            return
+        self.state.log.emit(f"Processing report written: {path}", "ok")
+        try:
+            os.startfile(path)  # open in default browser
+        except Exception:
+            QMessageBox.information(self, "Report", f"Report saved to:\n{path}")
+
     # -- tools -----------------------------------------------------------
     def _maybe_suggest_crs(self):
         if self.state.chunk.crs_mode == "local":
@@ -289,10 +314,14 @@ class MainWindow(QMainWindow):
                     f"Geotags detected. Tools ▸ Set Coordinate System suggests EPSG:{utm}.", "info")
 
     def set_crs(self):
-        dlg = CrsDialog(self, self.state.auto_utm_from_photos())
+        ch = self.state.chunk
+        center = next(((c.lon, c.lat) for c in ch.cameras if c.has_geotag), None)
+        dlg = CrsDialog(self, self.state.auto_utm_from_photos(), center_lonlat=center,
+                        current_vertical=(ch.vertical_datum, ch.geoid_separation))
         if dlg.exec():
             mode, epsg = dlg.result_crs()
-            self.state.set_crs(mode, epsg)
+            vdatum, geoid = dlg.result_vertical()
+            self.state.set_crs(mode, epsg, vdatum, geoid)
             self._update_crs_label()
 
     def show_engines(self):

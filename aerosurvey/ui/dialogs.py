@@ -4,10 +4,10 @@ from __future__ import annotations
 from typing import Optional, Tuple
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QButtonGroup, QDialog, QDialogButtonBox,
-                               QFormLayout, QHBoxLayout, QLabel, QMessageBox,
-                               QRadioButton, QSpinBox, QTableWidget,
-                               QTableWidgetItem, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QButtonGroup, QComboBox, QDialog, QDialogButtonBox,
+                               QDoubleSpinBox, QFormLayout, QHBoxLayout, QLabel,
+                               QMessageBox, QPushButton, QRadioButton, QSpinBox,
+                               QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from ..core import crs as crsmod
 from ..core import engines as enginemod
@@ -17,11 +17,14 @@ from ..theme import ERR_RED, FG_MUTED, OK_GREEN
 class CrsDialog(QDialog):
     """Pick Local / UTM / explicit EPSG for the active chunk."""
 
-    def __init__(self, parent, suggested_utm: Optional[int]):
+    def __init__(self, parent, suggested_utm: Optional[int], center_lonlat=None,
+                 current_vertical=("ellipsoidal", 0.0)):
         super().__init__(parent)
         self.setWindowTitle("Coordinate System")
-        self.setMinimumWidth(420)
+        self.setMinimumWidth(440)
         self._result: Tuple[str, Optional[int]] = ("local", None)
+        self._center = center_lonlat
+        self._vertical = tuple(current_vertical)
 
         lay = QVBoxLayout(self)
         lay.addWidget(QLabel("Choose how project coordinates and GCPs are interpreted:"))
@@ -64,6 +67,30 @@ class CrsDialog(QDialog):
         form.addRow("EPSG code:", erow)
         lay.addLayout(form)
 
+        lay.addWidget(QLabel("Vertical datum (height reference):"))
+        vform = QFormLayout()
+        self.vdatum = QComboBox()
+        self.vdatum.addItems(["Ellipsoidal (raw GPS height)",
+                              "Orthometric — mean sea level (geoid)"])
+        self.vdatum.setCurrentIndex(1 if self._vertical[0] == "orthometric" else 0)
+        vform.addRow("Datum:", self.vdatum)
+        self.geoid_spin = QDoubleSpinBox()
+        self.geoid_spin.setRange(-200.0, 200.0)
+        self.geoid_spin.setDecimals(3)
+        self.geoid_spin.setSuffix(" m")
+        self.geoid_spin.setValue(float(self._vertical[1]))
+        auto_btn = QPushButton("Auto (EGM2008)")
+        auto_btn.clicked.connect(self._auto_geoid)
+        grow = QWidget()
+        gl = QHBoxLayout(grow)
+        gl.setContentsMargins(0, 0, 0, 0)
+        gl.addWidget(self.geoid_spin)
+        gl.addWidget(auto_btn)
+        vform.addRow("Geoid separation N:", grow)
+        lay.addLayout(vform)
+        self.vdatum.currentIndexChanged.connect(self._update_vertical)
+        self._update_vertical()
+
         if suggested_utm:
             lay.addWidget(self._note(f"Suggested UTM zone from photo geotags: "
                                      f"EPSG:{suggested_utm}"))
@@ -99,10 +126,32 @@ class CrsDialog(QDialog):
                 QMessageBox.warning(self, "Invalid EPSG", "That EPSG code was not recognised.")
                 return
             self._result = ("epsg", self.epsg_spin.value())
+        datum = "orthometric" if self.vdatum.currentIndex() == 1 else "ellipsoidal"
+        self._vertical = (datum, self.geoid_spin.value() if datum == "orthometric" else 0.0)
         self.accept()
+
+    def _update_vertical(self):
+        self.geoid_spin.setEnabled(self.vdatum.currentIndex() == 1)
+
+    def _auto_geoid(self):
+        if not self._center:
+            QMessageBox.information(self, "Geoid", "No photo geotags to locate the survey area.")
+            return
+        lon, lat = self._center
+        n = crsmod.geoid_separation(lon, lat)
+        if n is None:
+            QMessageBox.information(self, "Geoid separation",
+                                    "EGM2008 geoid grid is unavailable offline. Enter N manually "
+                                    "(e.g. from an NGS/UNAVCO geoid calculator for your area).")
+        else:
+            self.geoid_spin.setValue(n)
+            self.vdatum.setCurrentIndex(1)
 
     def result_crs(self) -> Tuple[str, Optional[int]]:
         return self._result
+
+    def result_vertical(self):
+        return self._vertical
 
 
 class EngineStatusDialog(QDialog):
