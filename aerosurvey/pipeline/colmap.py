@@ -30,15 +30,19 @@ def available() -> bool:
 
 
 def version_major() -> int:
-    """Major COLMAP version (4.x renamed SiftExtraction/SiftMatching option groups)."""
+    """Major COLMAP version (4.x renamed SiftExtraction/SiftMatching option groups).
+
+    Defaults to 4 (current COLMAP) when detection is uncertain — a failed probe must
+    NOT fall back to the deprecated 3.x option names, which every 4.x build rejects.
+    """
     try:
-        out = subprocess.run([exe(), "help"], capture_output=True, text=True, timeout=20)
+        out = subprocess.run([exe(), "help"], capture_output=True, text=True, timeout=30)
         m = re.search(r"COLMAP\s+(\d+)\.", (out.stdout or "") + (out.stderr or ""))
         if m:
             return int(m.group(1))
     except Exception:
         pass
-    return 3
+    return 4
 
 
 # ---------------------------------------------------------------------------
