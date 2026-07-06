@@ -107,12 +107,17 @@ def run_dense(colmap_model_dir: str, image_dir: str, workdir: str, ctx,
 
 
 def load_ply(path: str):
-    """Read a PLY point cloud -> (points Nx3 float64, colors Nx3 uint8)."""
-    import open3d as o3d
-    pcd = o3d.io.read_point_cloud(path)
-    P = np.asarray(pcd.points, dtype=np.float64)
-    if pcd.has_colors() and len(pcd.colors):
-        C = (np.asarray(pcd.colors) * 255.0).clip(0, 255).astype(np.uint8)
+    """Read a PLY point cloud -> (points Nx3 float64, colors Nx3 uint8).
+
+    Uses plyfile (lightweight, pure-Python) so the core app has no Open3D
+    dependency and can be bundled into a small portable executable.
+    """
+    from plyfile import PlyData
+    v = PlyData.read(path)["vertex"]
+    names = v.data.dtype.names
+    P = np.column_stack([v["x"], v["y"], v["z"]]).astype(np.float64)
+    if all(k in names for k in ("red", "green", "blue")):
+        C = np.column_stack([v["red"], v["green"], v["blue"]]).astype(np.uint8)
     else:
         C = np.full((len(P), 3), 200, np.uint8)
     return P, C

@@ -185,6 +185,13 @@ class ModelView(QWidget):
             return
         path, _ = data
         mode = "class" if self.color_mode.currentIndex() == 1 else "rgb"
+        if getattr(sys, "frozen", False):
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.information(self, "3D viewer",
+                "The interactive Open3D viewer is not included in the portable build.\n"
+                "The top-down preview is shown here; use the full (source) version for the "
+                "pop-out 3-D view, or open the exported LAS in CloudCompare / QGIS.")
+            return
         try:
             subprocess.Popen([sys.executable, "-m", "aerosurvey.viewer3d", path, mode],
                              cwd=os.path.dirname(os.path.dirname(os.path.dirname(__file__))))

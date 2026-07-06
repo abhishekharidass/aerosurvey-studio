@@ -27,3 +27,7 @@ Thumbs.db
 runs/
 *.pptx
 InterfaceCOLMAP-*.log
+
+# PyInstaller portable-build artifacts (the .spec is kept as source)
+build/
+dist/
