@@ -31,3 +31,6 @@ InterfaceCOLMAP-*.log
 # PyInstaller portable-build artifacts (the .spec is kept as source)
 build/
 dist/
+
+# Local-only export presets (machine-specific, never published)
+aerosurvey/core/portal_export.py

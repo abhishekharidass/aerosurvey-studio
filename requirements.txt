@@ -10,6 +10,7 @@ numpy>=1.24
 pyproj>=3.5        # coordinate reference transforms (UTM / EPSG)
 rasterio>=1.3      # GeoTIFF DSM/DTM/orthomosaic I/O
 laspy>=2.5         # LAS/LAZ point clouds
+lazrs>=0.5         # LAZ compression backend for laspy (cloud-ready export)
 plyfile>=1.0       # read OpenMVS dense PLY (lightweight, no Open3D needed)
 open3d>=0.17       # optional: interactive pop-out 3D viewer (excluded from portable build)
 scikit-learn>=1.3  # trained Random Forest point-cloud classifier (+ joblib)

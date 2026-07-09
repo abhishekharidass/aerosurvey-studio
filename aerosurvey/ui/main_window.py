@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QKeySequence
@@ -267,22 +266,44 @@ class MainWindow(QMainWindow):
                                     "No rows parsed. Expected columns: label, X, Y, Z[, type].")
 
     def export_products(self):
+        from ..core import export as exportmod
         o = self.state.chunk.outputs
         products = [(k, v) for k, v in o.__dict__.items() if v and os.path.exists(v)]
         if not products:
             QMessageBox.information(self, "Export", "No products to export yet. Run the workflow first.")
             return
+        box = QMessageBox(self)
+        box.setWindowTitle("Export Products")
+        box.setText("Choose the export format:")
+        box.setInformativeText(
+            "Cloud-ready converts rasters to Cloud-Optimized GeoTIFF (streamable "
+            "on web platforms) and point clouds to compressed LAZ.\n"
+            "Original copies the files as they are.")
+        cloud_btn = box.addButton("Cloud-ready (COG + LAZ)", QMessageBox.AcceptRole)
+        preset = exportmod.load_portal_preset()
+        preset_btn = None
+        if preset is not None:
+            preset_btn = box.addButton(preset.PRESET_LABEL, QMessageBox.AcceptRole)
+            preset_btn.setToolTip(getattr(preset, "PRESET_TOOLTIP", ""))
+        orig_btn = box.addButton("Original files", QMessageBox.AcceptRole)
+        box.addButton(QMessageBox.Cancel)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked not in (cloud_btn, preset_btn, orig_btn) or clicked is None:
+            return
         out = QFileDialog.getExistingDirectory(self, "Export products to folder")
         if not out:
             return
-        for _key, src in products:
-            try:
-                shutil.copy2(src, os.path.join(out, os.path.basename(src)))
-            except Exception as exc:
-                self.state.log.emit(f"Export failed for {src}: {exc}", "error")
-        self.state.log.emit(f"Exported {len(products)} product(s) to {out}.", "ok")
+        emit = lambda m, lvl="info": self.state.log.emit(m, lvl)
+        if preset_btn is not None and clicked is preset_btn:
+            done = preset.export_package(
+                self.state.chunk, out, self.state.project.name, log=emit)
+        else:
+            done = exportmod.export_products(
+                self.state.chunk, out, cloud_ready=clicked is cloud_btn, log=emit)
+        self.state.log.emit(f"Exported {len(done)} product(s) to {out}.", "ok")
         QMessageBox.information(self, "Export",
-                                f"Exported {len(products)} product(s) to:\n{out}")
+                                f"Exported {len(done)} product(s) to:\n{out}")
 
     def generate_report_action(self):
         from ..report import generate_report
