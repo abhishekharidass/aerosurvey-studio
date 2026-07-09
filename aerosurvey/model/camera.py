@@ -19,11 +19,13 @@ class Camera:
     make: str = ""
     model: str = ""
     focal_mm: Optional[float] = None
+    focal35_mm: Optional[float] = None   # 35mm-equivalent focal length
     datetime: str = ""
     # Geotag (WGS84) as recorded by the drone
     lat: Optional[float] = None
     lon: Optional[float] = None
     alt: Optional[float] = None
+    rel_alt: Optional[float] = None      # height above take-off (XMP RelativeAltitude)
     # Gimbal / platform attitude in degrees (from XMP, if present)
     yaw: Optional[float] = None
     pitch: Optional[float] = None

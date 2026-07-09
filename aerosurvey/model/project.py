@@ -2,11 +2,42 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Dict, List, Optional
 
 from .camera import Camera
 from .gcp import GCP, Observation
+
+
+@dataclass
+class ProcessingSettings:
+    """User-adjustable pipeline parameters (Tools ▸ Processing Settings)."""
+
+    # Output resolution. "auto" = the estimated image GSD; "custom" = the
+    # explicit value in metres/pixel.
+    ortho_gsd_mode: str = "auto"
+    ortho_gsd: float = 0.05
+    surface_gsd_mode: str = "auto"      # DSM + DTM
+    surface_gsd: float = 0.05
+    # Safety cap on raster width/height; the cell size is coarsened to fit.
+    max_raster_dim: int = 20000
+
+    # Dense matching quality -> OpenMVS resolution level
+    # (ultra = full res, high = 1/2, medium = 1/4, low = 1/8).
+    dense_quality: str = "high"
+    # Target dense-cloud density in points/m² (0 = keep native density).
+    dense_target_density: float = 0.0
+
+    # Point classifier: "rules" (morphological+geometric) or "ml" (Random Forest).
+    classifier: str = "rules"
+
+    # SfM feature budget per image (more = denser sparse cloud, slower).
+    sfm_max_features: int = 8192
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ProcessingSettings":
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in (d or {}).items() if k in known})
 
 
 @dataclass
@@ -44,6 +75,7 @@ class Chunk:
 
     outputs: Outputs = field(default_factory=Outputs)
     stats: dict = field(default_factory=dict)   # processing metrics for the report
+    settings: ProcessingSettings = field(default_factory=ProcessingSettings)
 
     _next_cam_id: int = 1
     _next_gcp_id: int = 1
@@ -90,6 +122,7 @@ class Chunk:
             "next_gcp_id": self._next_gcp_id,
             "outputs": self.outputs.__dict__,
             "stats": self.stats,
+            "settings": self.settings.__dict__,
             "cameras": [c.__dict__ for c in self.cameras],
             "gcps": [
                 {
@@ -114,6 +147,7 @@ class Chunk:
         ch._next_gcp_id = d.get("next_gcp_id", 1)
         ch.outputs = Outputs(**d.get("outputs", {}))
         ch.stats = d.get("stats", {})
+        ch.settings = ProcessingSettings.from_dict(d.get("settings", {}))
         for cd in d.get("cameras", []):
             ch.cameras.append(Camera(**cd))
         for gd in d.get("gcps", []):

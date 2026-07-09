@@ -260,7 +260,8 @@ def _largest_model(sparse_dir: str) -> Optional[str]:
     return best
 
 
-def run_sfm(image_paths: List[str], workdir: str, ctx, use_gpu: bool = False) -> Optional[ColmapResult]:
+def run_sfm(image_paths: List[str], workdir: str, ctx, use_gpu: bool = False,
+            max_features: int = 8192) -> Optional[ColmapResult]:
     """Full COLMAP SfM. Returns a ColmapResult, or None on failure/cancellation."""
     col_dir = os.path.join(workdir, "colmap")
     os.makedirs(col_dir, exist_ok=True)
@@ -291,11 +292,15 @@ def run_sfm(image_paths: List[str], workdir: str, ctx, use_gpu: bool = False) ->
     feat = "FeatureExtraction" if major >= 4 else "SiftExtraction"
     match = "FeatureMatching" if major >= 4 else "SiftMatching"
 
+    feat_args = ["feature_extractor", "--database_path", db,
+                 "--image_path", img_dir,
+                 "--ImageReader.single_camera", "1",
+                 f"--{feat}.use_gpu", gpu]
+    if max_features and int(max_features) != 8192:  # 8192 is COLMAP's default
+        feat_args += [f"--{feat}.max_num_features", str(int(max_features))]
+
     steps = [
-        ("feature_extractor", ["feature_extractor", "--database_path", db,
-                               "--image_path", img_dir,
-                               "--ImageReader.single_camera", "1",
-                               f"--{feat}.use_gpu", gpu], 25),
+        ("feature_extractor", feat_args, 25),
         ("exhaustive_matcher", ["exhaustive_matcher", "--database_path", db,
                                 f"--{match}.use_gpu", gpu], 55),
         ("mapper", ["mapper", "--database_path", db, "--image_path", img_dir,

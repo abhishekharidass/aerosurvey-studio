@@ -154,6 +154,122 @@ class CrsDialog(QDialog):
         return self._vertical
 
 
+class ProcessingSettingsDialog(QDialog):
+    """Edit the chunk's ProcessingSettings (resolution, density, quality...)."""
+
+    def __init__(self, parent, chunk, estimated_gsd=None, ml_available=False):
+        super().__init__(parent)
+        self.setWindowTitle("Processing Settings")
+        self.setMinimumWidth(480)
+        self.chunk = chunk
+        s = chunk.settings
+
+        lay = QVBoxLayout(self)
+        est = (f"Estimated image GSD: {estimated_gsd*100:.1f} cm/px"
+               if estimated_gsd else
+               "Image GSD not estimable yet (needs EXIF focal + altitude, "
+               "or a solved alignment).")
+        est_lab = QLabel(est)
+        est_lab.setStyleSheet(f"color: {OK_GREEN if estimated_gsd else FG_MUTED};")
+        lay.addWidget(est_lab)
+
+        form = QFormLayout()
+
+        def gsd_row(mode, value):
+            combo = QComboBox()
+            combo.addItems(["Auto (image GSD)", "Custom"])
+            combo.setCurrentIndex(1 if mode == "custom" else 0)
+            spin = QDoubleSpinBox()
+            spin.setRange(0.005, 10.0)
+            spin.setDecimals(3)
+            spin.setSingleStep(0.01)
+            spin.setSuffix(" m/px")
+            spin.setValue(value)
+            spin.setEnabled(mode == "custom")
+            combo.currentIndexChanged.connect(lambda i, sp=spin: sp.setEnabled(i == 1))
+            row = QWidget()
+            h = QHBoxLayout(row)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.addWidget(combo)
+            h.addWidget(spin)
+            return row, combo, spin
+
+        row, self.ortho_mode, self.ortho_spin = gsd_row(s.ortho_gsd_mode, s.ortho_gsd)
+        form.addRow("Orthomosaic resolution:", row)
+        row, self.surf_mode, self.surf_spin = gsd_row(s.surface_gsd_mode, s.surface_gsd)
+        form.addRow("DSM / DTM resolution:", row)
+
+        self.max_dim = QSpinBox()
+        self.max_dim.setRange(2000, 100000)
+        self.max_dim.setSingleStep(1000)
+        self.max_dim.setSuffix(" px")
+        self.max_dim.setValue(int(s.max_raster_dim))
+        self.max_dim.setToolTip("Safety cap on raster width/height; finer GSDs "
+                                "are coarsened to fit.")
+        form.addRow("Max raster dimension:", self.max_dim)
+
+        self.quality = QComboBox()
+        self.quality.addItems(["Ultra (full resolution)", "High (1/2)",
+                               "Medium (1/4)", "Low (1/8)"])
+        self.quality.setCurrentIndex(
+            {"ultra": 0, "high": 1, "medium": 2, "low": 3}.get(s.dense_quality, 1))
+        form.addRow("Dense matching quality:", self.quality)
+
+        self.density = QDoubleSpinBox()
+        self.density.setRange(0.0, 100000.0)
+        self.density.setDecimals(0)
+        self.density.setSuffix(" pts/m²")
+        self.density.setSpecialValueText("Native (no limit)")
+        self.density.setValue(s.dense_target_density)
+        self.density.setToolTip("Thin the dense cloud to this density after "
+                                "matching. 0 keeps every point.")
+        form.addRow("Dense cloud density:", self.density)
+
+        self.classifier = QComboBox()
+        self.classifier.addItems(["Rule-based (morphology + geometry)",
+                                  "Machine learning (Random Forest)"])
+        self.classifier.setCurrentIndex(1 if s.classifier == "ml" else 0)
+        if not ml_available:
+            self.classifier.setCurrentIndex(0)
+            self.classifier.model().item(1).setEnabled(False)
+            self.classifier.setToolTip("No trained model found "
+                                       "(aerosurvey/models/pointcloud_rf.joblib).")
+        form.addRow("Point classifier:", self.classifier)
+
+        self.max_feat = QSpinBox()
+        self.max_feat.setRange(1024, 65536)
+        self.max_feat.setSingleStep(1024)
+        self.max_feat.setValue(int(s.sfm_max_features))
+        self.max_feat.setToolTip("SIFT features per image. More = denser sparse "
+                                 "cloud and better matching, slower alignment.")
+        form.addRow("SfM features per image:", self.max_feat)
+
+        lay.addLayout(form)
+        note = QLabel("Auto resolution matches the outputs to what the sensor "
+                      "captured. Values apply to the next processing run.")
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color: {FG_MUTED};")
+        lay.addWidget(note)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self._accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+    def _accept(self):
+        s = self.chunk.settings
+        s.ortho_gsd_mode = "custom" if self.ortho_mode.currentIndex() == 1 else "auto"
+        s.ortho_gsd = float(self.ortho_spin.value())
+        s.surface_gsd_mode = "custom" if self.surf_mode.currentIndex() == 1 else "auto"
+        s.surface_gsd = float(self.surf_spin.value())
+        s.max_raster_dim = int(self.max_dim.value())
+        s.dense_quality = ["ultra", "high", "medium", "low"][self.quality.currentIndex()]
+        s.dense_target_density = float(self.density.value())
+        s.classifier = "ml" if self.classifier.currentIndex() == 1 else "rules"
+        s.sfm_max_features = int(self.max_feat.value())
+        self.accept()
+
+
 class EngineStatusDialog(QDialog):
     """Report which external engines are detected on PATH."""
 

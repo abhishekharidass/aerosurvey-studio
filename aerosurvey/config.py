@@ -18,6 +18,7 @@ CLASS_NAMES = {
     4: "Medium vegetation",
     5: "High vegetation",
     6: "Building",
+    7: "Noise",
     9: "Water",
     17: "Bridge deck",
 }
@@ -30,6 +31,7 @@ CLASS_COLORS = {
     4: (70, 170, 70),
     5: (30, 130, 30),
     6: (210, 120, 90),
+    7: (230, 60, 180),
     9: (70, 140, 220),
     17: (200, 200, 90),
 }

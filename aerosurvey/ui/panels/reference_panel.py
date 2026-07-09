@@ -45,10 +45,18 @@ class ReferencePanel(QWidget):
         gl.addWidget(self.gcp_table)
 
         btns = QHBoxLayout()
-        for text, slot in [("Add GCP", self._add_gcp), ("Import CSV…", self._import_csv),
-                           ("Remove", self._remove_gcp)]:
+        for text, slot, tip in [
+                ("Add GCP", self._add_gcp, ""),
+                ("Import CSV…", self._import_csv, ""),
+                ("Auto-Mark", self._auto_mark,
+                 "Project GCP coordinates into the photos to place predicted "
+                 "marks (uses the solved alignment, or EXIF geotags before "
+                 "alignment). Existing marks are kept."),
+                ("Remove", self._remove_gcp, "")]:
             b = QPushButton(text)
             b.clicked.connect(slot)
+            if tip:
+                b.setToolTip(tip)
             btns.addWidget(b)
         btns.addStretch(1)
         gl.addLayout(btns)
@@ -163,6 +171,11 @@ class ReferencePanel(QWidget):
                                       f"Remove '{g.label}' and its {g.marked_count} marks?") \
                 == QMessageBox.Yes:
             self.state.remove_gcps([gid])
+
+    def _auto_mark(self) -> None:
+        items = self.gcp_table.selectedItems()
+        ids = [items[0].data(Qt.UserRole)] if items else None
+        self.state.auto_mark_gcps(ids)
 
     def _import_csv(self) -> None:
         from PySide6.QtWidgets import QFileDialog

@@ -43,8 +43,12 @@ def render_topdown(P: np.ndarray, C: np.ndarray, size: int = 720) -> QImage:
 def render_raster(path: str, size: int = 720) -> QImage:
     import rasterio
     with rasterio.open(path) as src:
-        data = src.read()
-    if data.shape[0] >= 3:  # RGB ortho
+        # decimated read: previews of multi-gigapixel rasters stay cheap
+        scale = max(max(src.width, src.height) / float(size), 1.0)
+        shape = (src.count, max(int(src.height / scale), 1),
+                 max(int(src.width / scale), 1))
+        data = src.read(out_shape=shape)
+    if data.shape[0] >= 3:  # RGB(A) ortho
         rgb = np.transpose(data[:3], (1, 2, 0))
         rgb = np.nan_to_num(rgb).clip(0, 255).astype(np.uint8)
     else:  # single-band elevation -> colourise

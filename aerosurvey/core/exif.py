@@ -78,12 +78,21 @@ def read_metadata(path: str) -> dict:
         return meta
 
     named = {_TAGS.get(k, k): v for k, v in exif.items()}
+    # FocalLength / DateTimeOriginal live in the Exif SubIFD, not IFD0.
+    try:
+        sub = exif.get_ifd(ExifTags.IFD.Exif)
+        named.update({_TAGS.get(k, k): v for k, v in sub.items()})
+    except Exception:
+        pass
     meta["make"] = str(named.get("Make", "")).strip("\x00 ")
     meta["model"] = str(named.get("Model", "")).strip("\x00 ")
     meta["datetime"] = str(named.get("DateTimeOriginal", named.get("DateTime", "")))
     fl = _ratio(named.get("FocalLength"))
     if fl:
         meta["focal_mm"] = fl
+    f35 = _ratio(named.get("FocalLengthIn35mmFilm"))
+    if f35:
+        meta["focal35_mm"] = f35
 
     # GPS block lives under IFD
     try:

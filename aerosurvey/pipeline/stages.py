@@ -116,98 +116,84 @@ def _write_las(path: str, P: np.ndarray, C: np.ndarray, cls: np.ndarray) -> None
     las.write(path)
 
 
-def _extent(P):
-    """(minx, miny, maxx, maxy) of a point set."""
-    return (float(P[:, 0].min()), float(P[:, 1].min()),
-            float(P[:, 0].max()), float(P[:, 1].max()))
-
-
-def _cell_indices(P, minx, maxy, cell, nx, ny):
-    """Column/row indices for each point (row 0 = north/top)."""
-    ix = np.clip(((P[:, 0] - minx) / cell).astype(int), 0, nx - 1)
-    iy = np.clip(((maxy - P[:, 1]) / cell).astype(int), 0, ny - 1)
-    return ix, iy
-
-
-def _grid(P, values, cell, reducer="max"):
-    """Rasterise scattered points over their own extent. Returns (arr, (minx, maxy), nx, ny)."""
-    minx, miny, maxx, maxy = _extent(P)
-    nx = max(int(np.ceil((maxx - minx) / cell)) + 1, 1)
-    ny = max(int(np.ceil((maxy - miny) / cell)) + 1, 1)
-    ix, iy = _cell_indices(P, minx, maxy, cell, nx, ny)
-    arr = np.full((ny, nx), np.nan, np.float32)
-    # ascending sort -> largest written last (max); reverse for min. Last write wins.
-    order = np.argsort(values) if reducer == "max" else np.argsort(-values)
-    arr[iy[order], ix[order]] = np.asarray(values, np.float32)[order]
-    return arr, (minx, maxy), nx, ny
-
-
-def _raster_cell(P, target_px=1000, min_cell=0.02):
-    """Pick a ground sample distance so the longer side is ~target_px cells."""
-    minx, miny, maxx, maxy = _extent(P)
-    span = max(maxx - minx, maxy - miny, 1.0)
-    return max(span / target_px, min_cell)
-
-
-def _dsm_cell(P):
-    return _raster_cell(P, target_px=800)
-
-
-def _to_vertical(chunk, arr):
-    """Convert ellipsoidal heights to orthometric (MSL) by removing the geoid
-    separation N, when the chunk uses an orthometric vertical datum."""
+def _z_offset(chunk) -> float:
+    """Vertical-datum shift: subtracting the geoid separation N converts
+    ellipsoidal heights to orthometric (MSL)."""
     if getattr(chunk, "vertical_datum", "ellipsoidal") == "orthometric" and chunk.geoid_separation:
-        return arr - float(chunk.geoid_separation)
-    return arr
+        return float(chunk.geoid_separation)
+    return 0.0
 
 
-def _fill_nan(arr: np.ndarray) -> np.ndarray:
-    """Cheap hole-fill by nearest finite neighbour via iterative dilation."""
-    out = arr.copy()
-    mask = np.isnan(out)
-    if not mask.any():
-        return out
-    for _ in range(25):
-        if not np.isnan(out).any():
-            break
-        shifted = []
-        for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-            s = np.full_like(out, np.nan)
-            r0 = max(dr, 0); r1 = out.shape[0] + min(dr, 0)
-            c0 = max(dc, 0); c1 = out.shape[1] + min(dc, 0)
-            s[r0:r1, c0:c1] = out[max(-dr, 0):out.shape[0] - max(dr, 0) or None,
-                                  max(-dc, 0):out.shape[1] - max(dc, 0) or None]
-            shifted.append(s)
-        stack = np.stack(shifted)
-        with np.errstate(all="ignore"):
-            import warnings
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", category=RuntimeWarning)
-                mean = np.nanmean(stack, axis=0)
-        take = np.isnan(out) & ~np.isnan(mean)
-        out[take] = mean[take]
-    return out
+def _image_gsd(ctx: "StageContext", P: np.ndarray, cls: np.ndarray = None):
+    """Best estimate of the source-photo GSD (m/px), cached in chunk.stats."""
+    from ..core import gsd as gsdmod
+    from . import recon
+    ch = ctx.chunk
+    cached = ch.stats.get("image_gsd_m")
+    if cached:
+        return float(cached)
+    f_map = {}
+    res = recon.get_reconstruction(ch, ctx.workdir)
+    if res is not None and res.intrinsics:
+        for cam in ch.cameras:
+            pose = res.poses.get(cam.filename)
+            K = res.intrinsics.get(pose.camera_id) if pose else None
+            if K is not None:
+                f_map[cam.id] = (float(K[0][0]) + float(K[1][1])) / 2.0
+    # ground elevation only comparable to est_z once georeferenced
+    ground_z = None
+    if ch.optimized:
+        if cls is not None and (cls == 2).any():
+            ground_z = float(np.median(P[cls == 2, 2]))   # classified ground
+        else:
+            ground_z = float(np.percentile(P[:, 2], 5))
+    g = gsdmod.estimate_gsd(ch, ground_z, f_map)
+    if g:
+        ch.stats["image_gsd_m"] = round(g, 4)
+    return g
 
 
-def _write_geotiff(path, arr, chunk: Chunk, origin, cell):
-    """Write a float32 GeoTIFF. origin = (minx, maxy) top-left corner."""
-    import rasterio
-    from rasterio.transform import from_origin
-    crs = None
-    if chunk.epsg:
-        try:
-            crs = rasterio.crs.CRS.from_epsg(chunk.epsg)
-        except Exception:
-            crs = None
-    minx, maxy = origin
-    transform = from_origin(minx, maxy, cell, cell)
-    if arr.ndim == 2:
-        arr = arr[np.newaxis, :, :]
-    profile = dict(driver="GTiff", height=arr.shape[1], width=arr.shape[2],
-                   count=arr.shape[0], dtype="float32", crs=crs, transform=transform,
-                   compress="lzw", nodata=(np.nan if arr.shape[0] == 1 else None))
-    with rasterio.open(path, "w", **profile) as dst:
-        dst.write(arr.astype(np.float32))
+def _target_cell(ctx: "StageContext", P: np.ndarray, kind: str,
+                 cls: np.ndarray = None) -> float:
+    """Output cell size for 'ortho' or 'surface' rasters, honouring settings."""
+    from . import raster
+    s = ctx.chunk.settings
+    if kind == "ortho":
+        mode, custom = s.ortho_gsd_mode, s.ortho_gsd
+    else:
+        mode, custom = s.surface_gsd_mode, s.surface_gsd
+    if mode == "custom" and custom > 0:
+        cell, src = float(custom), "custom"
+    else:
+        g = _image_gsd(ctx, P, cls)
+        if g:
+            cell, src = float(g), "auto — estimated image GSD"
+        else:
+            cell = max(raster.median_spacing(P), 0.02)
+            src = "point density (no GSD info available)"
+    minx, miny, maxx, maxy = raster.extent(P)
+    span = max(maxx - minx, maxy - miny, 1.0)
+    min_cell = span / max(int(s.max_raster_dim), 1000)
+    if cell < min_cell:
+        ctx.log(f"Requested {cell*100:.1f} cm cell needs a raster larger than "
+                f"{s.max_raster_dim} px — coarsened to {min_cell*100:.1f} cm "
+                "(raise 'Max raster dimension' in Processing Settings).", "warn")
+        cell = min_cell
+    ctx.log(f"{'Orthomosaic' if kind == 'ortho' else 'Surface'} resolution: "
+            f"{cell*100:.1f} cm/px ({src}).", "info")
+    return cell
+
+
+def _voxel_downsample(P: np.ndarray, C: np.ndarray, density: float):
+    """Thin a cloud to ~density points/m² (3D voxel grid, keeps first hit)."""
+    if density <= 0 or len(P) == 0:
+        return P, C
+    cell = 1.0 / np.sqrt(density)
+    ijk = np.floor(P / cell).astype(np.int64)
+    key = (ijk[:, 0] * 73856093) ^ (ijk[:, 1] * 19349663) ^ (ijk[:, 2] * 83492791)
+    _, idx = np.unique(key, return_index=True)
+    idx.sort()
+    return P[idx], C[idx]
 
 
 def _load_cloud(path):
@@ -245,7 +231,8 @@ def _align_colmap(ctx: StageContext, cams, colmap) -> bool:
         return False
     ctx.log(f"Structure-from-Motion on {len(image_paths)} images (feature extraction, "
             "matching, incremental mapping)...", "info")
-    res = colmap.run_sfm(image_paths, ctx.workdir, ctx)
+    res = colmap.run_sfm(image_paths, ctx.workdir, ctx,
+                         max_features=ctx.chunk.settings.sfm_max_features)
     if res is None:
         return False
     ctx.chunk._colmap_result = res  # transient: consumed by the georef stage
@@ -317,7 +304,7 @@ def _transform_las(path: str, sim) -> None:
 def run_georef(ctx: StageContext) -> bool:
     """Optimize / georeference: fit the reconstruction into the project CRS,
     preferring surveyed GCPs and falling back to camera GPS."""
-    from . import georef
+    from . import georef, recon
     from ..core import crs as crsmod
     ch = ctx.chunk
     if not ch.aligned:
@@ -327,27 +314,42 @@ def run_georef(ctx: StageContext) -> bool:
         g.error = None
 
     tf = crsmod.CrsTransform(ch.epsg if ch.crs_mode != "local" else None)
-    res = getattr(ch, "_colmap_result", None)
+    res = recon.get_reconstruction(ch, ctx.workdir, ctx)
     sim = None
 
     if res is not None and ch.gcps:
         sim = _georef_from_gcps(ctx, ch, res, georef)   # accurate, real reconstruction
     if sim is None:
-        sim = _georef_from_gps(ctx, ch, tf, georef)     # GPS similarity fallback
+        sim = _georef_from_gps(ctx, ch, tf, georef, res)  # GPS similarity fallback
     if sim is None:
         ctx.log("Not enough control to georeference (need >=3 geotagged aligned "
                 "cameras, or >=3 triangulable control GCPs).", "error")
         return False
 
-    for c in ch.cameras:
-        if c.est_x is not None:
-            x, y, z = sim.apply([c.est_x, c.est_y, c.est_z])
-            c.est_x, c.est_y, c.est_z = float(x), float(y), float(z)
-    if ch.outputs.sparse_cloud and os.path.exists(ch.outputs.sparse_cloud):
-        _transform_las(ch.outputs.sparse_cloud, sim)
-        ctx.log("Sparse cloud transformed into project CRS.", "info")
+    if res is not None:
+        # sim maps COLMAP's local frame -> project CRS: derive camera positions
+        # and the sparse cloud from the reconstruction (idempotent on re-runs).
+        by_name = {c.filename: c for c in ch.cameras}
+        for name, pose in res.poses.items():
+            cam = by_name.get(name)
+            if cam is not None:
+                x, y, z = sim.apply(pose.center)
+                cam.est_x, cam.est_y, cam.est_z = float(x), float(y), float(z)
+        if ch.outputs.sparse_cloud and len(res.points):
+            _write_las(ch.outputs.sparse_cloud, sim.apply(res.points), res.colors,
+                       np.ones(len(res.points), np.uint8))
+            ctx.log("Sparse cloud written in project CRS.", "info")
+    else:
+        for c in ch.cameras:
+            if c.est_x is not None:
+                x, y, z = sim.apply([c.est_x, c.est_y, c.est_z])
+                c.est_x, c.est_y, c.est_z = float(x), float(y), float(z)
+        if ch.outputs.sparse_cloud and os.path.exists(ch.outputs.sparse_cloud):
+            _transform_las(ch.outputs.sparse_cloud, sim)
+            ctx.log("Sparse cloud transformed into project CRS.", "info")
 
     ch._georef_sim = sim  # transient: applied to the dense cloud (still local on disk)
+    recon.save_sim(ctx.workdir, sim, ch.stats.get("georef_method", ""))
     if res is not None and getattr(res, "observations", None):
         try:
             _refine_bundle(ctx, ch, res, sim)
@@ -451,12 +453,25 @@ def _refine_bundle(ctx: StageContext, ch, res, sim) -> None:
                 f"k1 {r.intrinsics[3]:+.5f}.", "info")
 
 
-def _georef_from_gps(ctx, ch, tf, georef):
+def _georef_from_gps(ctx, ch, tf, georef, res=None):
+    """Fit local->world from camera geotags. With a real reconstruction the
+    local side comes from the COLMAP pose centres (always in the local frame,
+    so re-running georeference stays idempotent)."""
     local, world = [], []
     for c in ch.cameras:
-        if c.aligned and c.est_x is not None and c.has_geotag:
+        if not c.has_geotag:
+            continue
+        if res is not None:
+            pose = res.poses.get(c.filename)
+            if pose is None:
+                continue
+            local.append([float(pose.center[0]), float(pose.center[1]),
+                          float(pose.center[2])])
+        elif c.aligned and c.est_x is not None:
             local.append([c.est_x, c.est_y, c.est_z])
-            world.append(list(tf.forward(c.lon, c.lat, c.alt or 0.0)))
+        else:
+            continue
+        world.append(list(tf.forward(c.lon, c.lat, c.alt or 0.0)))
     if len(local) < 3:
         return None
     sim = georef.umeyama_similarity(np.array(local), np.array(world))
@@ -519,12 +534,12 @@ def _georef_from_gcps(ctx, ch, res, georef):
 def run_dense(ctx: StageContext) -> bool:
     """Dense reconstruction. Uses OpenMVS if installed (with a COLMAP result),
     else the built-in simulation."""
-    from . import colmap, openmvs
+    from . import colmap, openmvs, recon
     ch = ctx.chunk
     if not ch.aligned:
         ctx.log("Cameras are not aligned. Run 'Align Photos' first.", "error")
         return False
-    res = getattr(ch, "_colmap_result", None)
+    res = recon.get_reconstruction(ch, ctx.workdir, ctx)
     if openmvs.available() and colmap.available() and res is not None and res.model_dir:
         return _dense_openmvs(ctx, res, colmap, openmvs)
     if res is None or not colmap.available():
@@ -537,23 +552,35 @@ def run_dense(ctx: StageContext) -> bool:
 
 
 def _dense_openmvs(ctx: StageContext, res, colmap, openmvs) -> bool:
-    ctx.log(f"Dense multi-view stereo via OpenMVS ({openmvs.densify_exe()})...", "info")
-    ply = openmvs.run_dense(res.model_dir, res.image_dir, ctx.workdir, ctx, colmap.exe())
+    from . import recon
+    s = ctx.chunk.settings
+    ctx.log(f"Dense multi-view stereo via OpenMVS ({openmvs.densify_exe()}), "
+            f"quality: {s.dense_quality}...", "info")
+    ply = openmvs.run_dense(res.model_dir, res.image_dir, ctx.workdir, ctx,
+                            colmap.exe(), quality=s.dense_quality)
     if ply is None:
         return False
     P, C = openmvs.load_ply(ply)
     if len(P) == 0:
         ctx.log("OpenMVS dense cloud is empty.", "error")
         return False
-    sim = getattr(ctx.chunk, "_georef_sim", None)
+    sim = recon.get_sim(ctx.chunk, ctx.workdir)
     if sim is not None:
         P = sim.apply(P)  # carry local dense cloud into the project CRS
         ctx.log("Dense cloud transformed into project CRS.", "info")
+    if s.dense_target_density > 0:
+        n0 = len(P)
+        P, C = _voxel_downsample(P, C, s.dense_target_density)
+        ctx.log(f"Density limited to {s.dense_target_density:g} pts/m²: "
+                f"{n0:,} -> {len(P):,} points.", "info")
     out = os.path.join(ctx.workdir, "dense_cloud.las")
     _write_las(out, P, C, np.ones(len(P), np.uint8))
     ctx.chunk.outputs.dense_cloud = out
     ctx.chunk.stats["dense_points"] = int(len(P))
-    ctx.log(f"Dense cloud: {len(P):,} points -> {out}", "ok")
+    dens = len(P) / max((P[:, 0].max() - P[:, 0].min()) *
+                        (P[:, 1].max() - P[:, 1].min()), 1e-6)
+    ctx.chunk.stats["dense_density_ppm2"] = round(float(dens), 1)
+    ctx.log(f"Dense cloud: {len(P):,} points (~{dens:.1f} pts/m²) -> {out}", "ok")
     ctx.progress(100)
     return True
 
@@ -576,13 +603,6 @@ def _dense_simulated(ctx: StageContext) -> bool:
     return True
 
 
-def _classify_cell(P) -> float:
-    """Ground-filter cell size: ~1 m for typical drone extents, larger for big areas."""
-    minx, miny, maxx, maxy = _extent(P)
-    span = max(maxx - minx, maxy - miny, 1.0)
-    return min(max(span / 500.0, 1.0), 3.0)
-
-
 def run_classify(ctx: StageContext) -> bool:
     from . import classify, ml_classify
     path = ctx.chunk.outputs.dense_cloud
@@ -592,7 +612,7 @@ def run_classify(ctx: StageContext) -> bool:
     out = os.path.join(ctx.workdir, "classified_cloud.las")
 
     if classify.pdal_available():
-        ctx.log("Classifying with PDAL (SMRF ground filter + HAG)...", "info")
+        ctx.log("Classifying with PDAL (outlier + SMRF ground + HAG + coplanarity)...", "info")
         if classify.pdal_classify(path, out):
             ctx.chunk.outputs.classified_cloud = out
             _, _, cls = _load_cloud(out)
@@ -604,15 +624,17 @@ def run_classify(ctx: StageContext) -> bool:
         ctx.log("PDAL pipeline failed; falling back to built-in classifier.", "warn")
 
     P, C, _ = _load_cloud(path)
-    if not ctx.sleep(0.2):
-        return False
-    if os.environ.get("AEROSURVEY_USE_ML_CLASSIFIER") and ml_classify.available():
+    use_ml = (ctx.chunk.settings.classifier == "ml"
+              or os.environ.get("AEROSURVEY_USE_ML_CLASSIFIER"))
+    if use_ml and ml_classify.available():
         ctx.log("Classifying with the trained Random Forest model...", "info")
         cls = ml_classify.classify(P, C)
     else:
-        ctx.log("Classifying (progressive morphological ground filter + roughness split)...",
-                "info")
-        cls = classify.classify_cloud(P, C, cell=_classify_cell(P))
+        cell = classify.default_cell(P)
+        ctx.log(f"Classifying: outlier removal, progressive morphological ground "
+                f"filter ({cell:.1f} m cells), HAG + planarity split...", "info")
+        ctx.progress(10)
+        cls = classify.classify_cloud(P, C, cell=cell)
     if ctx.cancelled:
         return False
     ctx.progress(85)
@@ -630,23 +652,39 @@ def _cloud_for_surfaces(ch: Chunk):
     return path
 
 
+def _write_surface(ctx: StageContext, P: np.ndarray, values: np.ndarray,
+                   out: str, reducer: str, cls: np.ndarray = None) -> dict:
+    """DSM/DTM writer: native-density grid, hole-fill, interpolate to GSD."""
+    from . import raster
+    cell = _target_cell(ctx, P, "surface", cls)
+    native_cell = raster.pick_native_cell(P, cell)
+    nat = raster.native_grid(P, values, native_cell, reducer=reducer)
+    minx, miny, maxx, maxy = raster.extent(P)
+    nx, ny = raster.grid_shape(P, cell)
+    raster.write_interp_raster(
+        out, [nat], ctx.chunk, (minx, maxy), native_cell, cell, nx, ny,
+        dtype="float32", nodata=np.nan, z_offset=_z_offset(ctx.chunk),
+        progress=lambda p: ctx.progress(20 + int(p * 0.75)))
+    return {"w": nx, "h": ny, "gsd_m": round(cell, 4)}
+
+
 def run_dsm(ctx: StageContext) -> bool:
     path = _cloud_for_surfaces(ctx.chunk)
     if not path or not os.path.exists(path):
         ctx.log("No point cloud available for DSM.", "error")
         return False
-    ctx.log("Rasterising DSM (max Z per cell)...", "info")
-    P, _, _ = _load_cloud(path)
-    cell = _dsm_cell(P)
-    arr, origin, nx, ny = _grid(P, P[:, 2], cell=cell, reducer="max")
-    arr = _to_vertical(ctx.chunk, _fill_nan(arr))
-    if not ctx.sleep(0.4):
-        return False
+    ctx.log("Rasterising DSM (top surface)...", "info")
+    P, _, cls = _load_cloud(path)
+    keep = cls != 7                      # never build surfaces from noise points
+    if keep.any() and not keep.all():
+        P, cls = P[keep], cls[keep]
     out = os.path.join(ctx.workdir, "dsm.tif")
-    _write_geotiff(out, arr, ctx.chunk, origin, cell)
+    info = _write_surface(ctx, P, P[:, 2], out, reducer="max", cls=cls)
+    if ctx.cancelled:
+        return False
     ctx.chunk.outputs.dsm = out
-    ctx.chunk.stats["dsm"] = {"w": nx, "h": ny, "gsd_m": round(cell, 3)}
-    ctx.log(f"DSM {nx}x{ny} @ {cell:.3f} m -> {out}", "ok")
+    ctx.chunk.stats["dsm"] = info
+    ctx.log(f"DSM {info['w']}x{info['h']} @ {info['gsd_m']:.3f} m -> {out}", "ok")
     ctx.progress(100)
     return True
 
@@ -656,52 +694,76 @@ def run_dtm(ctx: StageContext) -> bool:
     if not path or not os.path.exists(path):
         ctx.log("DTM needs a classified cloud. Run 'Classify Points' first.", "error")
         return False
-    ctx.log("Rasterising DTM from ground-classified points (min Z)...", "info")
+    ctx.log("Rasterising DTM from ground-classified points...", "info")
     P, _, cls = _load_cloud(path)
     ground = P[cls == 2]
     if len(ground) == 0:
         ctx.log("No ground points found.", "error")
         return False
-    cell = _dsm_cell(P)
-    arr, origin, nx, ny = _grid(ground, ground[:, 2], cell=cell, reducer="min")
-    arr = _to_vertical(ctx.chunk, _fill_nan(arr))
-    if not ctx.sleep(0.4):
-        return False
     out = os.path.join(ctx.workdir, "dtm.tif")
-    _write_geotiff(out, arr, ctx.chunk, origin, cell)
+    info = _write_surface(ctx, ground, ground[:, 2], out, reducer="min",
+                          cls=np.full(len(ground), 2, np.uint8))
+    if ctx.cancelled:
+        return False
     ctx.chunk.outputs.dtm = out
-    ctx.chunk.stats["dtm"] = {"w": nx, "h": ny, "gsd_m": round(cell, 3)}
-    ctx.log(f"DTM {nx}x{ny} @ {cell:.3f} m -> {out}", "ok")
+    ctx.chunk.stats["dtm"] = info
+    ctx.log(f"DTM {info['w']}x{info['h']} @ {info['gsd_m']:.3f} m -> {out}", "ok")
     ctx.progress(100)
     return True
 
 
 def run_ortho(ctx: StageContext) -> bool:
+    from . import ortho as orthomod
+    from . import raster, recon
     path = _cloud_for_surfaces(ctx.chunk)
     if not path or not os.path.exists(path):
         ctx.log("No point cloud available for orthomosaic.", "error")
         return False
-    ctx.log("Projecting images onto DSM and mosaicking (nadir seamlines)...", "info")
-    P, C, _ = _load_cloud(path)
-    cell = _raster_cell(P, target_px=1600)
-    minx, miny, maxx, maxy = _extent(P)
-    nx = max(int(np.ceil((maxx - minx) / cell)) + 1, 1)
-    ny = max(int(np.ceil((maxy - miny) / cell)) + 1, 1)
-    ix, iy = _cell_indices(P, minx, maxy, cell, nx, ny)
-    order = np.argsort(P[:, 2])  # highest last -> top surface wins
-    rgb = np.zeros((3, ny, nx), np.float32)
-    for b in range(3):
-        band = np.full((ny, nx), np.nan, np.float32)
-        band[iy[order], ix[order]] = C[order, b].astype(np.float32)
-        rgb[b] = _fill_nan(band)
-        if not ctx.sleep(0.15):
-            return False
-        ctx.progress(30 + b * 20)
+    P, C, cls = _load_cloud(path)
+    keep = cls != 7
+    if keep.any() and not keep.all():
+        P, C, cls = P[keep], C[keep], cls[keep]
+    cell = _target_cell(ctx, P, "ortho", cls)
     out = os.path.join(ctx.workdir, "orthomosaic.tif")
-    _write_geotiff(out, rgb, ctx.chunk, (minx, maxy), cell)
+
+    res = recon.get_reconstruction(ctx.chunk, ctx.workdir, ctx)
+    sim = recon.get_sim(ctx.chunk, ctx.workdir)
+    if res is not None and sim is not None and res.intrinsics:
+        ctx.log("True orthorectification: projecting source photos onto the "
+                "surface model (nearest-nadir view per cell)...", "info")
+        info = orthomod.build_true_ortho(ctx, res, sim, P, cell, out)
+        if ctx.cancelled:
+            return False
+        if info is not None:
+            ctx.chunk.outputs.orthomosaic = out
+            info["engine"] = "true-ortho"
+            ctx.chunk.stats["ortho"] = info
+            ctx.log(f"Orthomosaic {info['w']}x{info['h']} @ {info['gsd_m']:.3f} m "
+                    f"({info['coverage_pct']}% covered, RGBA) -> {out}", "ok")
+            ctx.progress(100)
+            return True
+        ctx.log("True orthorectification unavailable — falling back to "
+                "point-cloud colour splatting.", "warn")
+    else:
+        ctx.log("No reconstruction/georeference on disk — orthomosaic from "
+                "point-cloud colours (run Align + Georeference for the "
+                "photo-projected version).", "warn")
+
+    native_cell = raster.pick_native_cell(P, cell)
+    natives = [raster.native_grid(P, C[:, b].astype(np.float32), native_cell,
+                                  orderby=P[:, 2]) for b in range(3)]
+    minx, miny, maxx, maxy = raster.extent(P)
+    nx, ny = raster.grid_shape(P, cell)
+    raster.write_interp_raster(
+        out, natives, ctx.chunk, (minx, maxy), native_cell, cell, nx, ny,
+        dtype="uint8", nodata=None,
+        progress=lambda p: ctx.progress(30 + int(p * 0.65)))
+    if ctx.cancelled:
+        return False
     ctx.chunk.outputs.orthomosaic = out
-    ctx.chunk.stats["ortho"] = {"w": nx, "h": ny, "gsd_m": round(cell, 3)}
-    ctx.log(f"Orthomosaic {nx}x{ny} @ {cell:.3f} m (3-band RGB) -> {out}", "ok")
+    ctx.chunk.stats["ortho"] = {"w": nx, "h": ny, "gsd_m": round(cell, 4),
+                                "engine": "splat"}
+    ctx.log(f"Orthomosaic {nx}x{ny} @ {cell:.3f} m (RGB) -> {out}", "ok")
     ctx.progress(100)
     return True
 

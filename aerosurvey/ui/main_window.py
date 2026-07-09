@@ -14,7 +14,7 @@ from ..config import APP_NAME, APP_VERSION, IMAGE_EXTENSIONS, PROJECT_EXT
 from ..core import engines as enginemod
 from ..pipeline import PIPELINE, PipelineWorker
 from ..state import AppState
-from .dialogs import CrsDialog, EngineStatusDialog
+from .dialogs import CrsDialog, EngineStatusDialog, ProcessingSettingsDialog
 from .panels.console_panel import ConsolePanel
 from .panels.photos_panel import PhotosPanel
 from .panels.reference_panel import ReferencePanel
@@ -96,6 +96,7 @@ class MainWindow(QMainWindow):
         self.act_quit = mk("Exit", self.close, "Ctrl+Q")
 
         self.act_crs = mk("Set Coordinate System…", self.set_crs)
+        self.act_settings = mk("Processing Settings…", self.show_settings, "Ctrl+,")
         self.act_engines = mk("Processing Engines…", self.show_engines)
         self.act_sample = mk("Generate Sample Dataset", self.generate_sample)
         self.act_about = mk("About", self.about)
@@ -144,6 +145,7 @@ class MainWindow(QMainWindow):
 
         m_tools = mb.addMenu("&Tools")
         m_tools.addAction(self.act_crs)
+        m_tools.addAction(self.act_settings)
         m_tools.addAction(self.act_engines)
         m_tools.addSeparator()
         m_tools.addAction(self.act_sample)
@@ -323,6 +325,17 @@ class MainWindow(QMainWindow):
             vdatum, geoid = dlg.result_vertical()
             self.state.set_crs(mode, epsg, vdatum, geoid)
             self._update_crs_label()
+
+    def show_settings(self):
+        from ..core import gsd as gsdmod
+        from ..pipeline import ml_classify
+        ch = self.state.chunk
+        est = ch.stats.get("image_gsd_m") or gsdmod.estimate_gsd(ch)
+        dlg = ProcessingSettingsDialog(self, ch, estimated_gsd=est,
+                                       ml_available=ml_classify.available())
+        if dlg.exec():
+            self.state.set_dirty()
+            self.state.log.emit("Processing settings updated.", "info")
 
     def show_engines(self):
         EngineStatusDialog(self).exec()

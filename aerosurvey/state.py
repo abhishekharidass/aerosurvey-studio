@@ -128,16 +128,19 @@ class AppState(QObject):
             cam.make = meta.get("make", "")
             cam.model = meta.get("model", "")
             cam.focal_mm = meta.get("focal_mm")
+            cam.focal35_mm = meta.get("focal35_mm")
             cam.datetime = meta.get("datetime", "")
             cam.lat = meta.get("lat")
             cam.lon = meta.get("lon")
             cam.alt = meta.get("alt")
+            cam.rel_alt = meta.get("rel_alt")
             cam.yaw = meta.get("yaw")
             cam.pitch = meta.get("pitch")
             cam.roll = meta.get("roll")
             added += 1
         self._reproject_cameras()
         if added:
+            ch.stats.pop("image_gsd_m", None)  # GSD estimate is stale now
             self.set_dirty()
             self.cameras_changed.emit()
             geotagged = sum(1 for c in ch.cameras if c.has_geotag)
@@ -211,6 +214,27 @@ class AppState(QObject):
     def set_active_gcp(self, gcp_id: int) -> None:
         self._active_gcp_id = gcp_id
         self.active_gcp_changed.emit(gcp_id)
+
+    def auto_mark_gcps(self, gcp_ids: Optional[List[int]] = None) -> int:
+        """Project GCP coordinates into the photos to place predicted marks."""
+        from .pipeline import gcp_project
+        try:
+            n, method = gcp_project.auto_mark(self.chunk, self.workdir(), gcp_ids)
+        except Exception as exc:
+            self.log.emit(f"Auto-marking failed: {exc}", "error")
+            return 0
+        if n:
+            self.set_dirty()
+            self.observations_changed.emit()
+            self.gcps_changed.emit()
+            src = ("solved camera poses" if method == "reconstruction"
+                   else "EXIF geotags (approximate — refine in the image view)")
+            self.log.emit(f"Auto-marked {n} observation(s) from {src}.", "ok")
+        else:
+            self.log.emit(
+                "No marks placed. GCPs need real coordinates, and photos need "
+                "either a solved alignment or EXIF geotags with focal length.", "warn")
+        return n
 
     # -- observations (markers) -----------------------------------------
     def mark(self, gcp_id: int, cam_id: int, px: float, py: float) -> None:

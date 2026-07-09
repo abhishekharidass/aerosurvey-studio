@@ -71,8 +71,13 @@ def _run(cmd: List[str], name: str, ctx) -> Optional[bool]:
     return True
 
 
+# Dense matching quality -> DensifyPointCloud --resolution-level
+# (how many times the images are halved before stereo matching).
+QUALITY_LEVELS = {"ultra": 0, "high": 1, "medium": 2, "low": 3}
+
+
 def run_dense(colmap_model_dir: str, image_dir: str, workdir: str, ctx,
-              colmap_exe: str) -> Optional[str]:
+              colmap_exe: str, quality: str = "high") -> Optional[str]:
     """Produce a dense PLY. Returns its path, or None on failure/cancellation."""
     mvs = os.path.join(workdir, "openmvs")
     os.makedirs(mvs, exist_ok=True)
@@ -92,9 +97,11 @@ def run_dense(colmap_model_dir: str, image_dir: str, workdir: str, ctx,
     ctx.progress(45)
 
     dens = [densify_exe(), scene, "-o", "scene_dense.mvs", "-w", mvs]
+    # env var overrides the project setting (debugging escape hatch)
     rl = os.environ.get("AEROSURVEY_MVS_RESOLUTION_LEVEL")
-    if rl:  # higher = more downsampling = faster/coarser dense cloud
-        dens += ["--resolution-level", str(rl)]
+    if not rl:
+        rl = str(QUALITY_LEVELS.get(quality, 1))
+    dens += ["--resolution-level", str(rl)]  # higher = more downsampling = coarser
     if _run(dens, "DensifyPointCloud", ctx) is not True:
         return None
     ctx.progress(85)
