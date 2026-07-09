@@ -27,7 +27,7 @@ from . import raster
 class _ImageCache:
     """Small LRU of decoded photos (~64 MB each for a 20 MP frame)."""
 
-    def __init__(self, cap: int = 6):
+    def __init__(self, cap: int = 10):
         self.cap = cap
         self._d: "OrderedDict[str, np.ndarray]" = OrderedDict()
 
@@ -122,10 +122,105 @@ def gather_cameras(res, sim, workdir: str, ctx) -> List[_OrthoCam]:
     return cams
 
 
+# -- projection helpers -------------------------------------------------------
+def _project_cam(cam: _OrthoCam, local_pts: np.ndarray):
+    """Project local-frame points into a camera. Returns (u, v, ok)."""
+    Xc = local_pts @ cam.R.T + cam.t
+    zc = Xc[:, 2]
+    ok = zc > 1e-6
+    uv = Xc[:, :2] / np.maximum(zc, 1e-9)[:, None]
+    u = cam.K[0, 0] * uv[:, 0] + cam.K[0, 2]
+    v = cam.K[1, 1] * uv[:, 1] + cam.K[1, 2]
+    w, h = cam.wh
+    ok &= (u >= 0) & (u <= w - 1) & (v >= 0) & (v <= h - 1)
+    return u, v, ok
+
+
+def _border_feather(cam: _OrthoCam, u: np.ndarray, v: np.ndarray,
+                    frac: float = 0.06) -> np.ndarray:
+    """0..1 weight that fades to 0 at the image border, so a camera's
+    footprint edge never produces a hard seam."""
+    w, h = cam.wh
+    feather = max(frac * min(w, h), 1.0)
+    d = np.minimum(np.minimum(u, w - 1 - u), np.minimum(v, h - 1 - v))
+    return np.clip(d / feather, 0.02, 1.0)
+
+
+def estimate_gains(cams, P: np.ndarray, inv, tree, cache,
+                   n_samples: int = 25000, seed: int = 0) -> np.ndarray:
+    """Per-camera RGB gains that equalise exposure between overlapping photos.
+
+    Samples cloud points seen by their two nearest cameras, collects the mean
+    log colour ratio per camera pair, and solves a least-squares system for
+    log-gains (anchored to mean 0). Returns (n_cams, 3) multiplicative gains.
+    """
+    n_cams = len(cams)
+    gains = np.ones((n_cams, 3), np.float64)
+    if n_cams < 2 or len(P) == 0:
+        return gains
+    rng = np.random.default_rng(seed)
+    pick = rng.choice(len(P), min(n_samples, len(P)), replace=False)
+    world = P[pick]
+    local = inv.apply(world)
+    _, nearest = tree.query(world[:, :2], k=2)
+    nearest = np.atleast_2d(nearest.reshape(len(world), -1))
+
+    # colours of each sample in its two candidate cameras
+    cols = np.full((2, len(world), 3), np.nan, np.float32)
+    for slot in range(2):
+        cand = nearest[:, slot]
+        for ci in np.unique(cand):
+            cam = cams[ci]
+            sel = np.where(cand == ci)[0]
+            u, v, ok = _project_cam(cam, local[sel])
+            if not ok.any():
+                continue
+            img = cache.get(cam.path)
+            if img is None:
+                continue
+            cols[slot, sel[ok]] = _bilinear(img, u[ok], v[ok])
+
+    both = ~np.isnan(cols[0, :, 0]) & ~np.isnan(cols[1, :, 0])
+    if both.sum() < 50:
+        return gains
+    ci, cj = nearest[both, 0], nearest[both, 1]
+    log_ratio = (np.log(np.clip(cols[1, both], 8, 255))
+                 - np.log(np.clip(cols[0, both], 8, 255)))  # log(cj_col)-log(ci_col)
+
+    # aggregate per (i, j) pair, then solve  g_i - g_j = mean log ratio
+    for ch in range(3):
+        pairs = {}
+        for a, b, r in zip(ci, cj, log_ratio[:, ch]):
+            key = (int(a), int(b))
+            s, n = pairs.get(key, (0.0, 0))
+            pairs[key] = (s + float(r), n + 1)
+        rows, rhs, wts = [], [], []
+        for (a, b), (s, n) in pairs.items():
+            if n < 5:
+                continue
+            row = np.zeros(n_cams)
+            row[a], row[b] = 1.0, -1.0
+            rows.append(row)
+            rhs.append(s / n)
+            wts.append(np.sqrt(n))
+        if len(rows) < 1:
+            continue
+        A = np.asarray(rows) * np.asarray(wts)[:, None]
+        y = np.asarray(rhs) * np.asarray(wts)
+        # anchor: mean log-gain = 0
+        A = np.vstack([A, np.full((1, n_cams), 10.0)])
+        y = np.append(y, 0.0)
+        g, *_ = np.linalg.lstsq(A, y, rcond=None)
+        gains[:, ch] = np.clip(np.exp(g), 0.6, 1.6)
+    return gains
+
+
 # -- main --------------------------------------------------------------------
 def build_true_ortho(ctx, res, sim, P: np.ndarray, cell: float,
-                     out_path: str, block: int = 1024) -> Optional[dict]:
-    """Write an RGBA orthomosaic GeoTIFF. Returns stats dict, or None."""
+                     out_path: str, block: int = 1024,
+                     k_blend: int = 2) -> Optional[dict]:
+    """Write an RGBA orthomosaic GeoTIFF with feathered multi-view blending
+    and global colour balancing. Returns stats dict, or None."""
     import rasterio
     from scipy.ndimage import map_coordinates
     from scipy.spatial import cKDTree
@@ -151,6 +246,14 @@ def build_true_ortho(ctx, res, sim, P: np.ndarray, cell: float,
     inv = sim.inverse()
     cache = _ImageCache()
 
+    ctx.log("Colour balancing: estimating per-photo exposure gains from "
+            "overlaps...", "info")
+    gains = estimate_gains(cams, P, inv, tree, cache)
+    spread = float(gains.max() - gains.min())
+    ctx.log(f"Colour gains solved for {len(cams)} photos "
+            f"(spread {spread:.2f}).", "info")
+    ctx.progress(8)
+
     profile = raster.geotiff_profile(ctx.chunk, origin, cell, nx, ny,
                                      count=4, dtype="uint8", nodata=None)
     profile["photometric"] = "RGB"
@@ -175,35 +278,60 @@ def build_true_ortho(ctx, res, sim, P: np.ndarray, cell: float,
             _, nearest = tree.query(world[:, :2], k=k)
             nearest = np.atleast_2d(nearest.reshape(len(world), -1))
 
-            rgb = np.zeros((len(world), 3), np.float32)
-            alpha = np.zeros(len(world), np.uint8)
-            todo = np.arange(len(world))
+            # sample the two best views per cell (nearest-camera order)
+            n = len(world)
+            rgb1 = np.zeros((n, 3), np.float32); w1 = np.zeros(n, np.float32)
+            rgb2 = np.zeros((n, 3), np.float32); w2 = np.zeros(n, np.float32)
+            n_views = np.zeros(n, np.uint8)
             for attempt in range(k):
-                if not len(todo):
+                active = np.where(n_views < k_blend)[0]
+                if not len(active):
                     break
-                cand = nearest[todo, attempt]
+                cand = nearest[active, attempt]
                 for ci in np.unique(cand):
                     cam = cams[ci]
-                    sel = todo[cand == ci]
-                    Xc = local[sel] @ cam.R.T + cam.t
-                    zc = Xc[:, 2]
-                    ok = zc > 1e-6
-                    uv = (Xc[:, :2] / np.maximum(zc, 1e-9)[:, None])
-                    u = cam.K[0, 0] * uv[:, 0] + cam.K[0, 2]
-                    v = cam.K[1, 1] * uv[:, 1] + cam.K[1, 2]
-                    w, h = cam.wh
-                    ok &= (u >= 0) & (u <= w - 1) & (v >= 0) & (v <= h - 1)
+                    sel = active[cand == ci]
+                    u, v, ok = _project_cam(cam, local[sel])
                     if not ok.any():
                         continue
                     img = cache.get(cam.path)
                     if img is None:
                         continue
                     hit = sel[ok]
-                    rgb[hit] = _bilinear(img, u[ok], v[ok])
-                    alpha[hit] = 255
-                todo = todo[alpha[todo] == 0]
+                    col = _bilinear(img, u[ok], v[ok]) * gains[ci]
+                    d2 = ((world[hit, 0] - cam.center_w[0]) ** 2
+                          + (world[hit, 1] - cam.center_w[1]) ** 2)
+                    wgt = (_border_feather(cam, u[ok], v[ok])
+                           / (d2 + 100.0)).astype(np.float32)
+                    first = n_views[hit] == 0
+                    h1, h2 = hit[first], hit[~first]
+                    rgb1[h1], w1[h1] = col[first], wgt[first]
+                    rgb2[h2], w2[h2] = col[~first], wgt[~first]
+                    n_views[hit] += 1
 
-            n_filled += int((alpha == 255).sum())
+            # feather seams only where the two views agree; where they
+            # disagree (occlusion, surface-model error) pick one decisively
+            # — blending disagreeing content produces ghosting.
+            got1, got2 = w1 > 0, w2 > 0
+            rgb = rgb1.copy()
+            both = got1 & got2
+            if both.any():
+                diff = np.abs(rgb1[both] - rgb2[both]).max(axis=1)
+                agree = diff < 30.0
+                bidx = np.where(both)[0]
+                aidx = bidx[agree]
+                ws = w1[aidx] + w2[aidx]
+                rgb[aidx] = (rgb1[aidx] * w1[aidx, None]
+                             + rgb2[aidx] * w2[aidx, None]) / ws[:, None]
+                didx = bidx[~agree]
+                take2 = w2[didx] > w1[didx]
+                rgb[didx[take2]] = rgb2[didx[take2]]
+            only2 = ~got1 & got2
+            rgb[only2] = rgb2[only2]
+            valid = got1 | got2
+            alpha = np.where(valid, 255, 0).astype(np.uint8)
+
+            n_filled += int(valid.sum())
             band = rgb.reshape(nrows, nx, 3)
             for b in range(3):
                 dst.write(np.clip(np.rint(band[:, :, b]), 0, 255).astype(np.uint8),
@@ -213,5 +341,5 @@ def build_true_ortho(ctx, res, sim, P: np.ndarray, cell: float,
             ctx.progress(10 + int(85 * r1 / ny))
 
     return {"w": nx, "h": ny, "gsd_m": round(cell, 4),
-            "cameras": len(cams), "coverage_pct":
-            round(100.0 * n_filled / max(nx * ny, 1), 1)}
+            "cameras": len(cams), "blend_views": k_blend,
+            "coverage_pct": round(100.0 * n_filled / max(nx * ny, 1), 1)}
