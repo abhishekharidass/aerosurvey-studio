@@ -221,8 +221,13 @@ def _load_mesh_points(workdir: str, sim) -> Optional[np.ndarray]:
     The mesh interpolates across weakly-matched areas (textureless roofs)
     under visibility constraints, giving a far better projection surface
     than per-cell statistics of the raw dense cloud."""
-    path = os.path.join(workdir, "openmvs", "scene_dense_mesh.ply")
-    if not os.path.exists(path):
+    path = None
+    for name in ("scene_refined.ply", "scene_dense_mesh.ply"):
+        cand = os.path.join(workdir, "openmvs", name)
+        if os.path.exists(cand):
+            path = cand
+            break
+    if path is None:
         return None
     try:
         from plyfile import PlyData
@@ -254,7 +259,7 @@ def _load_mesh_points(workdir: str, sim) -> Optional[np.ndarray]:
 # -- main --------------------------------------------------------------------
 def build_true_ortho(ctx, res, sim, P: np.ndarray, cell: float,
                      out_path: str, block: int = 1024,
-                     k_blend: int = 2) -> Optional[dict]:
+                     k_blend: int = 2, cls: np.ndarray = None) -> Optional[dict]:
     """Write an RGBA orthomosaic GeoTIFF with feathered multi-view blending
     and global colour balancing. Returns stats dict, or None."""
     import rasterio
@@ -271,14 +276,30 @@ def build_true_ortho(ctx, res, sim, P: np.ndarray, cell: float,
     origin = (minx, maxy)
 
     # Projection surface (project-CRS frame, no vertical-datum shift — the
-    # projection must stay in the georef frame). Prefer the OpenMVS mesh.
+    # projection must stay in the georef frame).
     native_cell = raster.pick_native_cell(P, cell)
-    mesh_pts = _load_mesh_points(ctx.workdir, sim)
-    if mesh_pts is not None:
-        ctx.log(f"Projection surface from the OpenMVS mesh "
-                f"({len(mesh_pts):,} samples).", "info")
-    zgrid, zcell = raster.projection_surface(
-        mesh_pts if mesh_pts is not None else P, native_cell)
+    mesh_pts = None
+    if cls is None or not (cls == 2).any():
+        mesh_pts = _load_mesh_points(ctx.workdir, sim)
+        if mesh_pts is not None:
+            ctx.log(f"Projection surface from the OpenMVS mesh "
+                    f"({len(mesh_pts):,} samples).", "info")
+    frame = (minx, miny, maxx, maxy)
+    if cls is not None and (cls == 2).any():
+        # Project onto the smooth GROUND surface (class-2 points). Elevated
+        # structures lean naturally like in a plain aerial photo — exactly
+        # how commercial mosaics look — and can never warp: reconstructed
+        # roof geometry is unreliable (hollow buildings, cranes, textureless
+        # formwork) and projecting onto it smears the imagery.
+        from scipy import ndimage
+        zgrid, zcell = raster.projection_surface(P[cls == 2], native_cell,
+                                                 frame=frame)
+        zgrid = ndimage.gaussian_filter(zgrid, sigma=2.0)
+        ctx.log("Projection surface: smoothed ground (elevated structures "
+                "keep natural lean, no warping).", "info")
+    else:
+        zgrid, zcell = raster.projection_surface(
+            mesh_pts if mesh_pts is not None else P, native_cell, frame=frame)
     ratio = cell / zcell
 
     centers = np.array([c.center_w[:2] for c in cams])
@@ -352,8 +373,11 @@ def build_true_ortho(ctx, res, sim, P: np.ndarray, cell: float,
                     n_views[hit] += 1
 
             # feather seams only where the two views agree; where they
-            # disagree (occlusion, surface-model error) pick one decisively
-            # — blending disagreeing content produces ghosting.
+            # disagree (occlusion, surface error, parallax on elevated
+            # content) STAY with the nearest camera — choosing by weight
+            # flip-flops between misregistered views across the overlap
+            # band and renders as wavy texture duplication. Only fall to
+            # view 2 when view 1 is clearly compromised (image border).
             got1, got2 = w1 > 0, w2 > 0
             rgb = rgb1.copy()
             both = got1 & got2
@@ -366,7 +390,7 @@ def build_true_ortho(ctx, res, sim, P: np.ndarray, cell: float,
                 rgb[aidx] = (rgb1[aidx] * w1[aidx, None]
                              + rgb2[aidx] * w2[aidx, None]) / ws[:, None]
                 didx = bidx[~agree]
-                take2 = w2[didx] > w1[didx]
+                take2 = w2[didx] > 4.0 * w1[didx]
                 rgb[didx[take2]] = rgb2[didx[take2]]
             only2 = ~got1 & got2
             rgb[only2] = rgb2[only2]

@@ -733,7 +733,7 @@ def run_ortho(ctx: StageContext) -> bool:
     if res is not None and sim is not None and res.intrinsics:
         ctx.log("True orthorectification: projecting source photos onto the "
                 "surface model (nearest-nadir view per cell)...", "info")
-        info = orthomod.build_true_ortho(ctx, res, sim, P, cell, out)
+        info = orthomod.build_true_ortho(ctx, res, sim, P, cell, out, cls=cls)
         if ctx.cancelled:
             return False
         if info is not None:

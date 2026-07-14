@@ -105,33 +105,52 @@ def fill_smooth(arr: np.ndarray) -> np.ndarray:
     return cur
 
 
-def projection_surface(P: np.ndarray, cell: float) -> Tuple[np.ndarray, float]:
+def projection_surface(P: np.ndarray, cell: float,
+                       frame: Tuple[float, float, float, float] = None
+                       ) -> Tuple[np.ndarray, float]:
     """Height grid for orthorectification. Returns (grid, grid_cell).
+
+    frame: (minx, miny, maxx, maxy) the grid must cover/align to — pass the
+    output raster's extent so grids from different point sets (mesh samples,
+    ground points) share one origin; points outside are clipped to the rim.
 
     Built at a coarse, stable cell (>= 1 m) as the *top* surface (per-cell
     max — a median falls onto interior floors of hollow buildings), then:
+      * local-median outlier knockout (crane clusters, residual flyers)
+        before any filling, so their heights cannot spread;
       * smooth diffusion fill for point-free areas (textureless slabs);
-      * grey *closing* to bridge dips inside structures — point-free roof
-        patches otherwise sag toward interior floors and swirl the texture;
       * grey *opening* to strip thin spikes (cranes, poles, outliers);
-      * median + Gaussian against residual matching ripple.
+      * median filter against residual matching ripple.
     A projection surface must be locally smooth: spatially varying height
     error warps the sampled imagery, while a locally constant offset only
     shifts it slightly under a near-nadir camera."""
     from scipy import ndimage
     cell_s = max(cell, 1.0)
-    minx, miny, maxx, maxy = extent(P)
-    nx, ny = grid_shape(P, cell_s)
+    minx, miny, maxx, maxy = frame if frame is not None else extent(P)
+    if frame is not None:  # drop points outside the frame, don't clip them in
+        keep = ((P[:, 0] >= minx) & (P[:, 0] <= maxx)
+                & (P[:, 1] >= miny) & (P[:, 1] <= maxy))
+        P = P[keep]
+    nx = max(int(np.ceil((maxx - minx) / cell_s)) + 1, 1)
+    ny = max(int(np.ceil((maxy - miny) / cell_s)) + 1, 1)
     ix, iy = cell_indices(P, minx, maxy, cell_s, nx, ny)
     z = np.asarray(P[:, 2], np.float32)
     order = np.argsort(z)
     arr = np.full((ny, nx), np.nan, np.float32)
     arr[iy[order], ix[order]] = z[order]          # max: highest written last
-    arr = fill_smooth(arr)
-    arr = ndimage.grey_closing(arr, size=7)       # bridge in-structure dips
-    arr = ndimage.grey_opening(arr, size=3)       # remove thin spikes
+    # knock out cells towering over their neighbourhood (crane clusters,
+    # residual flyers) BEFORE filling — otherwise the diffusion fill drags
+    # their heights across nearby empty areas as phantom plateaus
+    med = ndimage.median_filter(fill_nearest(arr.copy()), size=9)
+    outlier = ~np.isnan(arr) & (arr - med > 15.0)
+    arr[outlier] = np.nan
+    arr = fill_smooth(arr)                        # true holes only
+    arr = ndimage.grey_opening(arr, size=5)       # thin spikes (cranes, wires)
     arr = ndimage.median_filter(arr, size=3)
-    return ndimage.gaussian_filter(arr, sigma=1.0), cell_s
+    return arr, cell_s
+
+
+
 
 
 def pick_native_cell(P: np.ndarray, target_cell: float,
