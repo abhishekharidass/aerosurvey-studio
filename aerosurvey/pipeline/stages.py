@@ -661,11 +661,11 @@ def _write_surface(ctx: StageContext, P: np.ndarray, values: np.ndarray,
     nat = raster.native_grid(P, values, native_cell, reducer=reducer)
     minx, miny, maxx, maxy = raster.extent(P)
     nx, ny = raster.grid_shape(P, cell)
-    raster.write_interp_raster(
+    final = raster.write_interp_raster(
         out, [nat], ctx.chunk, (minx, maxy), native_cell, cell, nx, ny,
         dtype="float32", nodata=np.nan, z_offset=_z_offset(ctx.chunk),
-        progress=lambda p: ctx.progress(20 + int(p * 0.75)))
-    return {"w": nx, "h": ny, "gsd_m": round(cell, 4)}
+        progress=lambda p: ctx.progress(20 + int(p * 0.75)), log=ctx.log)
+    return {"w": nx, "h": ny, "gsd_m": round(cell, 4), "path": final}
 
 
 def run_dsm(ctx: StageContext) -> bool:
@@ -682,6 +682,7 @@ def run_dsm(ctx: StageContext) -> bool:
     info = _write_surface(ctx, P, P[:, 2], out, reducer="max", cls=cls)
     if ctx.cancelled:
         return False
+    out = info.pop("path", out)
     ctx.chunk.outputs.dsm = out
     ctx.chunk.stats["dsm"] = info
     ctx.log(f"DSM {info['w']}x{info['h']} @ {info['gsd_m']:.3f} m -> {out}", "ok")
@@ -705,6 +706,7 @@ def run_dtm(ctx: StageContext) -> bool:
                           cls=np.full(len(ground), 2, np.uint8))
     if ctx.cancelled:
         return False
+    out = info.pop("path", out)
     ctx.chunk.outputs.dtm = out
     ctx.chunk.stats["dtm"] = info
     ctx.log(f"DTM {info['w']}x{info['h']} @ {info['gsd_m']:.3f} m -> {out}", "ok")
@@ -735,6 +737,7 @@ def run_ortho(ctx: StageContext) -> bool:
         if ctx.cancelled:
             return False
         if info is not None:
+            out = info.pop("path", out)
             ctx.chunk.outputs.orthomosaic = out
             info["engine"] = "true-ortho"
             ctx.chunk.stats["ortho"] = info
@@ -754,10 +757,10 @@ def run_ortho(ctx: StageContext) -> bool:
                                   orderby=P[:, 2]) for b in range(3)]
     minx, miny, maxx, maxy = raster.extent(P)
     nx, ny = raster.grid_shape(P, cell)
-    raster.write_interp_raster(
+    out = raster.write_interp_raster(
         out, natives, ctx.chunk, (minx, maxy), native_cell, cell, nx, ny,
         dtype="uint8", nodata=None,
-        progress=lambda p: ctx.progress(30 + int(p * 0.65)))
+        progress=lambda p: ctx.progress(30 + int(p * 0.65)), log=ctx.log)
     if ctx.cancelled:
         return False
     ctx.chunk.outputs.orthomosaic = out

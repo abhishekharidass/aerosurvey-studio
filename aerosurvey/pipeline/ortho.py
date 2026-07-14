@@ -215,6 +215,42 @@ def estimate_gains(cams, P: np.ndarray, inv, tree, cache,
     return gains
 
 
+def _load_mesh_points(workdir: str, sim) -> Optional[np.ndarray]:
+    """Sample the OpenMVS surface mesh (if built) into project-CRS points.
+
+    The mesh interpolates across weakly-matched areas (textureless roofs)
+    under visibility constraints, giving a far better projection surface
+    than per-cell statistics of the raw dense cloud."""
+    path = os.path.join(workdir, "openmvs", "scene_dense_mesh.ply")
+    if not os.path.exists(path):
+        return None
+    try:
+        from plyfile import PlyData
+        ply = PlyData.read(path)
+        v = ply["vertex"]
+        verts = np.column_stack([v["x"], v["y"], v["z"]]).astype(np.float64)
+        faces = np.vstack(ply["face"].data["vertex_indices"]).astype(np.int64)
+    except Exception:
+        return None
+    if len(verts) == 0:
+        return None
+    if len(faces):
+        v0, v1, v2 = verts[faces[:, 0]], verts[faces[:, 1]], verts[faces[:, 2]]
+        area = 0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0), axis=1)
+        # ~1 extra sample per m² of triangle area, capped for degenerate faces
+        counts = np.minimum(np.ceil(area).astype(np.int64), 64)
+        idx = np.repeat(np.arange(len(faces)), counts)
+        if len(idx):
+            rng = np.random.default_rng(0)
+            r1 = np.sqrt(rng.random(len(idx)))
+            r2 = rng.random(len(idx))
+            a, b, c = 1 - r1, r1 * (1 - r2), r1 * r2
+            extra = (a[:, None] * v0[idx] + b[:, None] * v1[idx]
+                     + c[:, None] * v2[idx])
+            verts = np.vstack([verts, extra])
+    return sim.apply(verts)
+
+
 # -- main --------------------------------------------------------------------
 def build_true_ortho(ctx, res, sim, P: np.ndarray, cell: float,
                      out_path: str, block: int = 1024,
@@ -234,11 +270,16 @@ def build_true_ortho(ctx, res, sim, P: np.ndarray, cell: float,
     nx, ny = raster.grid_shape(P, cell)
     origin = (minx, maxy)
 
-    # surface heights at native cloud resolution (project-CRS frame, no
-    # vertical-datum shift — the projection must stay in the georef frame)
+    # Projection surface (project-CRS frame, no vertical-datum shift — the
+    # projection must stay in the georef frame). Prefer the OpenMVS mesh.
     native_cell = raster.pick_native_cell(P, cell)
-    zgrid = raster.native_grid(P, P[:, 2], native_cell, reducer="max")
-    ratio = cell / native_cell
+    mesh_pts = _load_mesh_points(ctx.workdir, sim)
+    if mesh_pts is not None:
+        ctx.log(f"Projection surface from the OpenMVS mesh "
+                f"({len(mesh_pts):,} samples).", "info")
+    zgrid, zcell = raster.projection_surface(
+        mesh_pts if mesh_pts is not None else P, native_cell)
+    ratio = cell / zcell
 
     centers = np.array([c.center_w[:2] for c in cams])
     tree = cKDTree(centers)
@@ -258,7 +299,8 @@ def build_true_ortho(ctx, res, sim, P: np.ndarray, cell: float,
                                      count=4, dtype="uint8", nodata=None)
     profile["photometric"] = "RGB"
     n_filled = 0
-    with rasterio.open(out_path, "w", **profile) as dst:
+    tmp = out_path + ".part.tif"
+    with rasterio.open(tmp, "w", **profile) as dst:
         for r0 in range(0, ny, block):
             if ctx.cancelled:
                 return None
@@ -340,6 +382,7 @@ def build_true_ortho(ctx, res, sim, P: np.ndarray, cell: float,
                       window=((r0, r1), (0, nx)))
             ctx.progress(10 + int(85 * r1 / ny))
 
+    final = raster.finalize_output(tmp, out_path, ctx.log)
     return {"w": nx, "h": ny, "gsd_m": round(cell, 4),
-            "cameras": len(cams), "blend_views": k_blend,
+            "cameras": len(cams), "blend_views": k_blend, "path": final,
             "coverage_pct": round(100.0 * n_filled / max(nx * ny, 1), 1)}

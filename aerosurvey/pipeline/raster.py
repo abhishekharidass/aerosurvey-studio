@@ -74,6 +74,66 @@ def native_grid(P: np.ndarray, values: np.ndarray, cell: float,
     return fill_nearest(arr)
 
 
+def fill_smooth(arr: np.ndarray) -> np.ndarray:
+    """Fill NaN regions with *smooth* interpolation (coarse-to-fine pyramid).
+
+    Nearest-neighbour filling is wrong for texture projection: a point-free
+    slab interior inherits scaffold/ground heights from its rim and the
+    projected imagery warps by metres. Diffusion filling spans holes with a
+    smooth surface anchored at their edges instead."""
+    import warnings
+    if not np.isnan(arr).any():
+        return arr
+    levels = []
+    cur = arr.astype(np.float32, copy=True)
+    while np.isnan(cur).any() and min(cur.shape) > 2:
+        levels.append(cur)
+        ny, nx = cur.shape
+        py, px = (ny + 1) // 2, (nx + 1) // 2
+        pad = np.full((py * 2, px * 2), np.nan, np.float32)
+        pad[:ny, :nx] = cur
+        blocks = pad.reshape(py, 2, px, 2).transpose(0, 2, 1, 3).reshape(py, px, 4)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            cur = np.nanmean(blocks, axis=2)
+    if np.isnan(cur).any():
+        cur = np.where(np.isnan(cur), np.float32(np.nanmean(cur)), cur)
+    for lvl in reversed(levels):
+        ny, nx = lvl.shape
+        up = np.repeat(np.repeat(cur, 2, axis=0), 2, axis=1)[:ny, :nx]
+        cur = np.where(np.isnan(lvl), up, lvl)
+    return cur
+
+
+def projection_surface(P: np.ndarray, cell: float) -> Tuple[np.ndarray, float]:
+    """Height grid for orthorectification. Returns (grid, grid_cell).
+
+    Built at a coarse, stable cell (>= 1 m) as the *top* surface (per-cell
+    max — a median falls onto interior floors of hollow buildings), then:
+      * smooth diffusion fill for point-free areas (textureless slabs);
+      * grey *closing* to bridge dips inside structures — point-free roof
+        patches otherwise sag toward interior floors and swirl the texture;
+      * grey *opening* to strip thin spikes (cranes, poles, outliers);
+      * median + Gaussian against residual matching ripple.
+    A projection surface must be locally smooth: spatially varying height
+    error warps the sampled imagery, while a locally constant offset only
+    shifts it slightly under a near-nadir camera."""
+    from scipy import ndimage
+    cell_s = max(cell, 1.0)
+    minx, miny, maxx, maxy = extent(P)
+    nx, ny = grid_shape(P, cell_s)
+    ix, iy = cell_indices(P, minx, maxy, cell_s, nx, ny)
+    z = np.asarray(P[:, 2], np.float32)
+    order = np.argsort(z)
+    arr = np.full((ny, nx), np.nan, np.float32)
+    arr[iy[order], ix[order]] = z[order]          # max: highest written last
+    arr = fill_smooth(arr)
+    arr = ndimage.grey_closing(arr, size=7)       # bridge in-structure dips
+    arr = ndimage.grey_opening(arr, size=3)       # remove thin spikes
+    arr = ndimage.median_filter(arr, size=3)
+    return ndimage.gaussian_filter(arr, sigma=1.0), cell_s
+
+
 def pick_native_cell(P: np.ndarray, target_cell: float,
                      factor: float = 1.5) -> float:
     """Grid cell the cloud can actually populate: max(target, ~point spacing)."""
@@ -81,6 +141,30 @@ def pick_native_cell(P: np.ndarray, target_cell: float,
 
 
 # -- GeoTIFF writing -----------------------------------------------------
+def finalize_output(tmp_path: str, out_path: str, log=None) -> str:
+    """Move a finished temp raster onto its target name. If the target is
+    locked by another program (GIS viewer with the old file open), keep the
+    result under a timestamped name instead of losing the computation."""
+    import time
+    try:
+        os.replace(tmp_path, out_path)
+        return out_path
+    except PermissionError:
+        time.sleep(3)
+        try:
+            os.replace(tmp_path, out_path)
+            return out_path
+        except PermissionError:
+            base, ext = os.path.splitext(out_path)
+            alt = f"{base}_{time.strftime('%H%M%S')}{ext}"
+            os.replace(tmp_path, alt)
+            if log:
+                log(f"{os.path.basename(out_path)} is locked by another program "
+                    f"(close it in your GIS viewer) — result saved as "
+                    f"{os.path.basename(alt)}.", "warn")
+            return alt
+
+
 def geotiff_profile(chunk, origin, cell, nx, ny, count, dtype, nodata):
     import rasterio
     from rasterio.transform import from_origin
@@ -101,19 +185,21 @@ def write_interp_raster(path: str, natives: List[np.ndarray], chunk,
                         origin, native_cell: float, cell: float,
                         nx: int, ny: int, dtype: str = "float32",
                         nodata=None, z_offset: float = 0.0,
-                        block: int = 2048, progress=None) -> None:
+                        block: int = 2048, progress=None, log=None) -> str:
     """Write native-resolution band grids as a GeoTIFF at the target cell,
     interpolating block-by-block (bilinear) so memory stays bounded.
 
     natives: list of (ny_native, nx_native) float32 arrays (already filled).
     z_offset: subtracted from every value (vertical datum shift).
+    Returns the final path (may differ if the target was locked).
     """
     import rasterio
     from scipy.ndimage import map_coordinates
     profile = geotiff_profile(chunk, origin, cell, nx, ny,
                               count=len(natives), dtype=dtype, nodata=nodata)
     ratio = cell / native_cell
-    with rasterio.open(path, "w", **profile) as dst:
+    tmp = path + ".part.tif"
+    with rasterio.open(tmp, "w", **profile) as dst:
         for r0 in range(0, ny, block):
             r1 = min(r0 + block, ny)
             # centre-of-cell coordinates of the target block in native units
@@ -130,3 +216,4 @@ def write_interp_raster(path: str, natives: List[np.ndarray], chunk,
                           indexes=b, window=((r0, r1), (0, nx)))
             if progress:
                 progress(int(100 * r1 / ny))
+    return finalize_output(tmp, path, log)
