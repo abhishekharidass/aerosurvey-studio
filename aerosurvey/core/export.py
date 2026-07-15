@@ -19,10 +19,21 @@ PRODUCT_LABELS = {
     "sparse_cloud": "Sparse cloud",
     "dense_cloud": "Dense cloud",
     "classified_cloud": "Classified cloud",
+    "mesh": "Textured mesh",
     "dsm": "DSM",
     "dtm": "DTM",
     "orthomosaic": "Orthomosaic",
 }
+
+
+def _copy_mesh_bundle(obj_path: str, out_dir: str) -> str:
+    """Copy an OBJ together with its .mtl / texture / offset sidecars."""
+    src_dir = os.path.dirname(obj_path)
+    dst_dir = os.path.join(out_dir, "mesh")
+    os.makedirs(dst_dir, exist_ok=True)
+    for fn in os.listdir(src_dir):
+        shutil.copy2(os.path.join(src_dir, fn), os.path.join(dst_dir, fn))
+    return os.path.join(dst_dir, os.path.basename(obj_path))
 
 
 def to_cog(src: str, dst: str) -> None:
@@ -86,7 +97,9 @@ def export_products(chunk, out_dir: str, cloud_ready: bool = True,
         label = PRODUCT_LABELS.get(key, key)
         base = os.path.splitext(os.path.basename(src))[0]
         try:
-            if cloud_ready and src.lower().endswith((".tif", ".tiff")):
+            if key == "mesh":
+                dst = _copy_mesh_bundle(src, out_dir)
+            elif cloud_ready and src.lower().endswith((".tif", ".tiff")):
                 dst = os.path.join(out_dir, base + "_cog.tif")
                 to_cog(src, dst)
             elif use_laz and src.lower().endswith(".las"):

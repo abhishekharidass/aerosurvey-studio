@@ -34,8 +34,20 @@ def densify_exe() -> str:
     return _which("DensifyPointCloud", "DensifyPointCloud.exe")
 
 
+def reconstruct_exe() -> str:
+    return _which("ReconstructMesh", "ReconstructMesh.exe")
+
+
+def texture_exe() -> str:
+    return _which("TextureMesh", "TextureMesh.exe")
+
+
 def available() -> bool:
     return bool(densify_exe() and interface_exe())
+
+
+def mesh_available() -> bool:
+    return bool(reconstruct_exe() and texture_exe())
 
 
 def _run(cmd: List[str], name: str, ctx) -> Optional[bool]:
@@ -111,6 +123,64 @@ def run_dense(colmap_model_dir: str, image_dir: str, workdir: str, ctx,
         ctx.log("DensifyPointCloud produced no scene_dense.ply.", "error")
         return None
     return ply
+
+
+def run_mesh(workdir: str, ctx, max_faces: int = 2_000_000) -> Optional[str]:
+    """ReconstructMesh + TextureMesh over the densified scene.
+
+    Needs openmvs/scene_dense.mvs from a real dense run. Meshes above
+    `max_faces` are decimated before texturing (full-density construction
+    meshes reach tens of millions of faces — untexturable in reasonable
+    time and unusable as OBJ). Returns the textured OBJ path (COLMAP-local
+    frame), or None on failure/cancellation.
+    """
+    from . import mesh as meshmod
+    mvs = os.path.join(workdir, "openmvs")
+    scene_dense = os.path.join(mvs, "scene_dense.mvs")
+    if not os.path.exists(scene_dense):
+        ctx.log("No openmvs/scene_dense.mvs — run a real dense stage first.",
+                "error")
+        return None
+
+    def fresh(path: str) -> bool:
+        return (os.path.exists(path)
+                and os.path.getmtime(path) >= os.path.getmtime(scene_dense))
+
+    mesh_ply = os.path.join(mvs, "scene_mesh.ply")
+    if fresh(mesh_ply):
+        ctx.log("Reusing existing scene_mesh.ply (newer than the dense scene).",
+                "info")
+    else:
+        if _run([reconstruct_exe(), scene_dense,
+                 "-o", os.path.join(mvs, "scene_mesh.mvs"), "-w", mvs],
+                "ReconstructMesh", ctx) is not True:
+            return None
+        if not os.path.exists(mesh_ply):
+            ctx.log("ReconstructMesh produced no scene_mesh.ply.", "error")
+            return None
+    ctx.progress(55)
+
+    obj = os.path.join(mvs, "scene_textured.obj")
+    if os.path.exists(obj) and os.path.getmtime(obj) >= os.path.getmtime(mesh_ply):
+        ctx.log("Reusing existing scene_textured.obj.", "info")
+        return obj
+    cmd = [texture_exe(), scene_dense, "-m", mesh_ply,
+           "-o", os.path.join(mvs, "scene_textured.mvs"),
+           "--export-type", "obj", "-w", mvs]
+    faces = meshmod.ply_face_count(mesh_ply)
+    if max_faces and faces > max_faces:
+        factor = max_faces / faces
+        ctx.log(f"Decimating mesh for texturing: {faces:,} -> "
+                f"~{max_faces:,} faces (factor {factor:.3f}).", "info")
+        cmd += ["--decimate", f"{factor:.4f}"]
+    if _run(cmd, "TextureMesh", ctx) is not True:
+        return None
+    ctx.progress(90)
+
+    if not os.path.exists(obj):
+        ctx.log("TextureMesh produced no scene_textured.obj.", "error")
+        return None
+    return obj
 
 
 def load_ply(path: str):

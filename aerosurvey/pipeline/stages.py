@@ -10,6 +10,7 @@ change needed to go from scaffold to production for that step.
 from __future__ import annotations
 
 import os
+import shutil
 import time
 from dataclasses import dataclass, field
 from typing import Callable, List
@@ -258,6 +259,12 @@ def _align_colmap(ctx: StageContext, cams, colmap) -> bool:
     ctx.chunk.stats.update({"cameras_total": len(cams), "cameras_aligned": matched,
                             "mean_reproj_px": round(float(res.mean_reproj_error), 3),
                             "sparse_points": int(len(res.points)), "align_engine": "COLMAP"})
+    if res.intrinsics:
+        K = next(iter(res.intrinsics.values()))
+        ctx.chunk.stats["calibration"] = {
+            "focal_px": round(float((K[0][0] + K[1][1]) / 2.0), 2),
+            "cx": round(float(K[0][2]), 2), "cy": round(float(K[1][2]), 2),
+            "source": "COLMAP"}
     ctx.log(f"COLMAP aligned {matched}/{len(cams)} cameras "
             f"(mean reprojection error {res.mean_reproj_error:.3f} px).", "ok")
     ctx.log("Note: poses are in COLMAP's local frame; georeferencing to GCPs/GPS is a "
@@ -448,6 +455,12 @@ def _refine_bundle(ctx: StageContext, ch, res, sim) -> None:
     ctx.log(f"Bundle adjustment: reprojection RMSE {r.rmse_before:.3f} -> "
             f"{r.rmse_after:.3f} px over {r.n_obs} observations.", "ok")
     if r.intrinsics is not None:
+        ch.stats["calibration"] = {
+            "focal_px": round(float(r.intrinsics[0]), 2),
+            "cx": round(float(r.intrinsics[1]), 2),
+            "cy": round(float(r.intrinsics[2]), 2),
+            "k1": round(float(r.intrinsics[3]), 6),
+            "source": "self-calibrated (bundle adjustment)"}
         ctx.log(f"Self-calibration: focal {shared[0]:.1f} -> {r.intrinsics[0]:.1f} px, "
                 f"principal ({r.intrinsics[1]:.1f}, {r.intrinsics[2]:.1f}), "
                 f"k1 {r.intrinsics[3]:+.5f}.", "info")
@@ -476,7 +489,8 @@ def _georef_from_gps(ctx, ch, tf, georef, res=None):
         return None
     sim = georef.umeyama_similarity(np.array(local), np.array(world))
     fit = georef.residuals(np.array(local), np.array(world), sim)
-    ch.stats.update({"georef_method": "Camera GPS", "georef_rmse_m": round(float(fit.rmse), 3)})
+    ch.stats.update({"georef_method": "Camera GPS", "georef_rmse_m": round(float(fit.rmse), 3),
+                     "georef_rmse_xyz_m": [round(float(v), 3) for v in fit.rmse_axis]})
     ctx.log(f"GPS georeferencing from {len(local)} cameras: RMSE {fit.rmse:.3f} m "
             f"(X {fit.rmse_axis[0]:.3f}, Y {fit.rmse_axis[1]:.3f}, Z {fit.rmse_axis[2]:.3f}).",
             "ok")
@@ -518,9 +532,12 @@ def _georef_from_gcps(ctx, ch, res, georef):
     for g, e in zip(labels, fit.per_point):
         g.error = float(e)
     control_rmse = float(np.sqrt(np.mean(fit.per_point[ctrl] ** 2)))
+    ctrl_fit = georef.residuals(L[ctrl], W[ctrl], sim)
     ch.stats.update({"georef_method": "Ground Control Points", "gcp_control": len(control),
                      "gcp_check": len(checks) - len(control),
-                     "control_rmse_m": round(control_rmse, 3)})
+                     "control_rmse_m": round(control_rmse, 3),
+                     "georef_rmse_xyz_m": [round(float(v), 3)
+                                           for v in ctrl_fit.rmse_axis]})
     ctx.log(f"GCP georeferencing: {len(control)} control, {len(checks) - len(control)} check. "
             f"Control RMSE {control_rmse:.3f} m.", "ok")
     check = np.array([i for i, chk in enumerate(checks) if chk], dtype=int)
@@ -600,6 +617,80 @@ def _dense_simulated(ctx: StageContext) -> bool:
     ctx.chunk.stats["dense_points"] = int(len(P))
     ctx.progress(100)
     ctx.log(f"Dense cloud: {len(P):,} points -> {out}", "ok")
+    return True
+
+
+def run_mesh(ctx: StageContext) -> bool:
+    """Textured 3D mesh (OBJ). OpenMVS ReconstructMesh + TextureMesh over the
+    densified scene; falls back to a coloured heightfield from the dense cloud."""
+    from . import mesh as meshmod
+    from . import openmvs, recon
+    ch = ctx.chunk
+    if not ch.outputs.dense_cloud or not os.path.exists(ch.outputs.dense_cloud):
+        ctx.log("No dense cloud. Run 'Build Dense Cloud' first.", "error")
+        return False
+    epsg = ch.epsg if ch.crs_mode != "local" else None
+    out_dir = os.path.join(ctx.workdir, "mesh")
+    os.makedirs(out_dir, exist_ok=True)
+
+    scene_dense = os.path.join(ctx.workdir, "openmvs", "scene_dense.mvs")
+    if openmvs.mesh_available() and os.path.exists(scene_dense):
+        ctx.log(f"Meshing via OpenMVS ({openmvs.reconstruct_exe()})...", "info")
+        obj = openmvs.run_mesh(ctx.workdir, ctx,
+                               max_faces=ch.settings.mesh_max_faces)
+        if obj is None:
+            return False
+        # textures + material file travel with the OBJ
+        src_dir = os.path.dirname(obj)
+        for fn in os.listdir(src_dir):
+            base, ext = os.path.splitext(fn)
+            if base.startswith("scene_textured") and ext.lower() not in (
+                    ".obj", ".mvs", ".log", ".dmap"):
+                shutil.copy2(os.path.join(src_dir, fn), os.path.join(out_dir, fn))
+        sim = recon.get_sim(ch, ctx.workdir)
+        v0 = meshmod.peek_first_vertex(obj)
+        if v0 is None:
+            ctx.log("Textured mesh has no vertices.", "error")
+            return False
+        offset = meshmod.auto_offset(sim.apply(v0) if sim is not None else v0)
+        out_obj = os.path.join(out_dir, "model.obj")
+        nv, nf = meshmod.transform_obj(obj, out_obj, sim, offset, epsg)
+        if sim is not None:
+            ctx.log("Mesh transformed into project CRS "
+                    f"(offset {offset[0]:.0f}, {offset[1]:.0f} recorded in "
+                    "model_offset.txt).", "info")
+    else:
+        if not openmvs.mesh_available():
+            ctx.log("OpenMVS ReconstructMesh/TextureMesh not found — building a "
+                    "coloured heightfield mesh from the dense cloud.", "warn")
+        else:
+            ctx.log("No OpenMVS dense scene on disk — building a coloured "
+                    "heightfield mesh from the dense cloud.", "warn")
+        import laspy
+        las = laspy.read(ch.outputs.dense_cloud)
+        P = np.column_stack([las.x, las.y, las.z])
+        C = (np.column_stack([las.red, las.green, las.blue]) // 257).astype(np.uint8)
+        ctx.progress(30)
+        span = max(P[:, 0].max() - P[:, 0].min(),
+                   P[:, 1].max() - P[:, 1].min(), 1e-6)
+        cell = max(span / 400.0, 0.05)
+        verts, colors, faces = meshmod.heightfield_mesh(P, C, cell)
+        if len(faces) == 0:
+            ctx.log("Mesh triangulation produced no faces.", "error")
+            return False
+        ctx.progress(70)
+        out_obj = os.path.join(out_dir, "model.obj")
+        offset = meshmod.auto_offset(verts.min(axis=0))
+        meshmod.write_obj_with_colors(out_obj, verts, colors, faces, offset, epsg)
+        nv, nf = len(verts), len(faces)
+
+    ch.outputs.mesh = out_obj
+    ch.stats["mesh_vertices"] = int(nv)
+    ch.stats["mesh_faces"] = int(nf)
+    mb = os.path.getsize(out_obj) / 1e6
+    ctx.log(f"Textured mesh: {nv:,} vertices, {nf:,} faces -> {out_obj} "
+            f"({mb:.1f} MB)", "ok")
+    ctx.progress(100)
     return True
 
 
@@ -785,6 +876,7 @@ PIPELINE: List[Stage] = [
     Stage("georef", "Optimize / Georeference", "internal", run_georef,
           "Cameras in project CRS + GCP accuracy report"),
     Stage("dense", "Build Dense Cloud", "openmvs", run_dense, "Dense point cloud (LAS)"),
+    Stage("mesh", "Build Textured Mesh", "openmvs", run_mesh, "Textured 3D mesh (OBJ)"),
     Stage("classify", "Classify Points", "pdal", run_classify, "Classified cloud"),
     Stage("dsm", "Build DSM", "gdal", run_dsm, "Digital Surface Model (GeoTIFF)"),
     Stage("dtm", "Build DTM", "gdal", run_dtm, "Digital Terrain Model (GeoTIFF)"),

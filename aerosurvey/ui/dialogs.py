@@ -244,6 +244,25 @@ class ProcessingSettingsDialog(QDialog):
                                  "cloud and better matching, slower alignment.")
         form.addRow("SfM features per image:", self.max_feat)
 
+        from PySide6.QtWidgets import QCheckBox
+        self.mesh_cb = QCheckBox("Build textured 3D mesh in full pipeline runs")
+        self.mesh_cb.setChecked(bool(s.build_mesh))
+        self.mesh_cb.setToolTip("ReconstructMesh + TextureMesh (OpenMVS) after the "
+                                "dense stage. CPU-heavy; the stage can also be run "
+                                "on demand from the Workflow menu.")
+        form.addRow("Textured mesh:", self.mesh_cb)
+
+        self.mesh_faces = QSpinBox()
+        self.mesh_faces.setRange(0, 50_000_000)
+        self.mesh_faces.setSingleStep(500_000)
+        self.mesh_faces.setGroupSeparatorShown(True)
+        self.mesh_faces.setSpecialValueText("No limit")
+        self.mesh_faces.setValue(int(s.mesh_max_faces))
+        self.mesh_faces.setToolTip("Decimate the mesh to at most this many faces "
+                                   "before texturing. Full-density meshes reach "
+                                   "tens of millions of faces and take hours.")
+        form.addRow("Mesh face limit:", self.mesh_faces)
+
         lay.addLayout(form)
         note = QLabel("Auto resolution matches the outputs to what the sensor "
                       "captured. Values apply to the next processing run.")
@@ -267,6 +286,8 @@ class ProcessingSettingsDialog(QDialog):
         s.dense_target_density = float(self.density.value())
         s.classifier = "ml" if self.classifier.currentIndex() == 1 else "rules"
         s.sfm_max_features = int(self.max_feat.value())
+        s.build_mesh = bool(self.mesh_cb.isChecked())
+        s.mesh_max_faces = int(self.mesh_faces.value())
         self.accept()
 
 
@@ -355,3 +376,98 @@ class ContourDialog(QDialog):
                                         ("geojson", self.cb_geojson))
                         if cb.isChecked())
         return (self.source.currentData(), float(self.interval.value()), formats)
+
+
+class VolumeBaseDialog(QDialog):
+    """Pick the base surface for a volume measurement."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("Volume Base Surface")
+        self.setMinimumWidth(360)
+        lay = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.mode = QComboBox()
+        self.mode.addItem("Lowest boundary point (stockpile toe)", "lowest")
+        self.mode.addItem("Mean boundary elevation", "mean")
+        self.mode.addItem("Best-fit plane through boundary (slopes)", "fit")
+        self.mode.addItem("Custom elevation", "custom")
+        form.addRow("Base surface:", self.mode)
+
+        self.custom_z = QDoubleSpinBox()
+        self.custom_z.setRange(-10000.0, 10000.0)
+        self.custom_z.setDecimals(2)
+        self.custom_z.setSuffix(" m")
+        self.custom_z.setEnabled(False)
+        self.mode.currentIndexChanged.connect(
+            lambda i: self.custom_z.setEnabled(self.mode.currentData() == "custom"))
+        form.addRow("Custom elevation:", self.custom_z)
+        lay.addLayout(form)
+
+        hint = QLabel("Cut = material above the base, Fill = void below it. "
+                      "The base is derived from DSM elevations along the "
+                      "polygon boundary.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {FG_MUTED};")
+        lay.addWidget(hint)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+    def result_options(self):
+        return self.mode.currentData(), float(self.custom_z.value())
+
+
+class WebTilesDialog(QDialog):
+    """Options for the web-tiles / KML superoverlay export."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        from PySide6.QtWidgets import QCheckBox
+        self.setWindowTitle("Export Web Tiles / KML")
+        self.setMinimumWidth(380)
+        lay = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.zoom_auto = QComboBox()
+        self.zoom_auto.addItems(["Auto (from image GSD)", "Custom range"])
+        form.addRow("Zoom levels:", self.zoom_auto)
+
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        self.zmin = QSpinBox(); self.zmin.setRange(1, 22); self.zmin.setValue(14)
+        self.zmax = QSpinBox(); self.zmax.setRange(1, 22); self.zmax.setValue(20)
+        h.addWidget(QLabel("min")); h.addWidget(self.zmin)
+        h.addWidget(QLabel("max")); h.addWidget(self.zmax)
+        row.setEnabled(False)
+        self.zoom_auto.currentIndexChanged.connect(
+            lambda i, r=row: r.setEnabled(i == 1))
+        form.addRow("", row)
+        lay.addLayout(form)
+
+        self.cb_kml = QCheckBox("KML superoverlay for Google Earth (doc.kml)")
+        self.cb_kml.setChecked(True)
+        lay.addWidget(self.cb_kml)
+
+        hint = QLabel("Tiles use the standard z/x/y scheme (OSM / MapLibre / "
+                      "Leaflet / QGIS). Transparent tiles are skipped.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {FG_MUTED};")
+        lay.addWidget(hint)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+    def result_options(self):
+        if self.zoom_auto.currentIndex() == 0:
+            return None, None, self.cb_kml.isChecked()
+        zmin, zmax = self.zmin.value(), self.zmax.value()
+        if zmin > zmax:
+            zmin, zmax = zmax, zmin
+        return zmin, zmax, self.cb_kml.isChecked()

@@ -9,14 +9,14 @@ from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, QUrl
-from PySide6.QtGui import (QBrush, QColor, QFont, QImage, QPainter, QPen,
-                           QPixmap, QTransform)
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import (QBrush, QColor, QFont, QImage, QPainter, QPainterPath,
+                           QPen, QPixmap, QTransform)
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest
-from PySide6.QtWidgets import (QComboBox, QGraphicsItem, QGraphicsPixmapItem,
-                               QGraphicsScene, QGraphicsView, QHBoxLayout,
-                               QLabel, QPushButton, QSlider, QVBoxLayout,
-                               QWidget)
+from PySide6.QtWidgets import (QComboBox, QGraphicsItem, QGraphicsPathItem,
+                               QGraphicsPixmapItem, QGraphicsScene,
+                               QGraphicsView, QHBoxLayout, QLabel, QMessageBox,
+                               QPushButton, QSlider, QVBoxLayout, QWidget)
 
 from ...config import APP_NAME, APP_VERSION
 from ...core import webmercator as wm
@@ -102,6 +102,8 @@ class GcpFlag(QGraphicsItem):
 class MapCanvas(QGraphicsView):
     """Pan/zoom canvas over the mercator scene; owns the tile layer."""
 
+    measure_finished = Signal(list)   # [(mx, my), ...] mercator metres
+
     def __init__(self, log):
         super().__init__()
         self.log = log
@@ -126,8 +128,70 @@ class MapCanvas(QGraphicsView):
         self._pending = set()
         self._net_warned = False
 
+        self.measure_mode = False
+        self._measure_pts = []    # scene coords
+        self._measure_item = None
+
         # world view until the project provides a location
         self.scale(3e-5, 3e-5)
+
+    # -- volume measurement (polygon sketching) ---------------------------
+    def set_measure_mode(self, on: bool):
+        self.measure_mode = on
+        self._clear_measure()
+        self.setDragMode(QGraphicsView.NoDrag if on
+                         else QGraphicsView.ScrollHandDrag)
+        self.viewport().setCursor(Qt.CrossCursor if on else Qt.ArrowCursor)
+
+    def _clear_measure(self):
+        self._measure_pts = []
+        if self._measure_item is not None:
+            self.scene().removeItem(self._measure_item)
+            self._measure_item = None
+
+    def _redraw_measure(self):
+        if self._measure_item is None:
+            self._measure_item = QGraphicsPathItem()
+            pen = QPen(QColor(ACCENT), 0)          # cosmetic width-0 pen
+            pen.setStyle(Qt.DashLine)
+            self._measure_item.setPen(pen)
+            self._measure_item.setBrush(QColor(61, 142, 201, 60))
+            self._measure_item.setZValue(30)
+            self.scene().addItem(self._measure_item)
+        path = QPainterPath()
+        if self._measure_pts:
+            path.moveTo(self._measure_pts[0])
+            for p in self._measure_pts[1:]:
+                path.lineTo(p)
+            path.closeSubpath()
+        self._measure_item.setPath(path)
+
+    def mousePressEvent(self, event):
+        if self.measure_mode and event.button() == Qt.LeftButton:
+            self._measure_pts.append(self.mapToScene(event.position().toPoint()))
+            self._redraw_measure()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if self.measure_mode:
+            if len(self._measure_pts) >= 3:
+                pts = [(p.x(), -p.y()) for p in self._measure_pts]  # scene->mercator
+                self.measure_finished.emit(pts)
+            else:
+                self.log("A volume polygon needs at least 3 corners.", "warn")
+            self._clear_measure()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def keyPressEvent(self, event):
+        if self.measure_mode and event.key() == Qt.Key_Escape:
+            self._clear_measure()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     # -- navigation -------------------------------------------------------
     def wheelEvent(self, event):
@@ -274,12 +338,19 @@ class MapView(QWidget):
         self.opacity.valueChanged.connect(self._on_opacity)
         bar.addWidget(self.opacity)
         bar.addStretch(1)
+        self.measure_btn = QPushButton("Measure volume")
+        self.measure_btn.setCheckable(True)
+        self.measure_btn.setToolTip("Click the stockpile corners on the map; "
+                                    "double-click to close the polygon. Esc restarts.")
+        self.measure_btn.toggled.connect(self._on_measure_toggled)
+        bar.addWidget(self.measure_btn)
         fit = QPushButton("Zoom to project")
         fit.clicked.connect(self.zoom_to_project)
         bar.addWidget(fit)
         lay.addLayout(bar)
 
         self.canvas = MapCanvas(state.log.emit)
+        self.canvas.measure_finished.connect(self._on_measure_finished)
         lay.addWidget(self.canvas, 1)
 
         self.attribution = QLabel(PROVIDERS[self.canvas.provider_key]["attribution"])
@@ -301,6 +372,65 @@ class MapView(QWidget):
     def _on_opacity(self, val: int):
         if self._ortho_item:
             self._ortho_item.setOpacity(val / 100.0)
+
+    # -- volume measurement -------------------------------------------------
+    def _on_measure_toggled(self, on: bool):
+        if on:
+            o = self.state.chunk.outputs
+            if not (o.dsm and os.path.exists(o.dsm)):
+                QMessageBox.information(self, "Measure volume",
+                                        "No DSM yet — run 'Build DSM' first.")
+                self.measure_btn.setChecked(False)
+                return
+            if self.state.chunk.crs_mode == "local" or not self.state.chunk.epsg:
+                QMessageBox.information(self, "Measure volume",
+                                        "Volumes need a georeferenced project "
+                                        "(set a CRS and re-run georeferencing).")
+                self.measure_btn.setChecked(False)
+                return
+            self.state.log.emit("Volume tool: click the outline on the map, "
+                                "double-click to finish.", "info")
+        self.canvas.set_measure_mode(self.measure_btn.isChecked())
+
+    def _on_measure_finished(self, merc_pts):
+        from ...core import volumes as volmod
+        from ..dialogs import VolumeBaseDialog
+        self.measure_btn.setChecked(False)
+        try:
+            from pyproj import Transformer
+            tf = Transformer.from_crs("EPSG:3857",
+                                      f"EPSG:{self.state.chunk.epsg}",
+                                      always_xy=True)
+            poly = [tf.transform(mx, my) for mx, my in merc_pts]
+        except Exception as exc:
+            QMessageBox.critical(self, "Measure volume",
+                                 f"Coordinate transform failed:\n{exc}")
+            return
+        dlg = VolumeBaseDialog(self)
+        if not dlg.exec():
+            return
+        mode, custom_z = dlg.result_options()
+        try:
+            r = volmod.measure_volume(self.state.chunk.outputs.dsm, poly,
+                                      mode, custom_z)
+        except Exception as exc:
+            QMessageBox.critical(self, "Measure volume", str(exc))
+            return
+        self.state.log.emit(f"Volume: {r.summary()}", "ok")
+        for w in r.warnings:
+            self.state.log.emit(f"Volume: {w}", "warn")
+        lines = [f"Cut (above base):  {r.cut_m3:,.1f} m³",
+                 f"Fill (below base):  {r.fill_m3:,.1f} m³",
+                 f"Net:  {r.net_m3:+,.1f} m³", "",
+                 f"Polygon area: {r.area_m2:,.1f} m² "
+                 f"({r.coverage * 100:.0f}% has DSM data)",
+                 f"Base [{r.base_mode}]: {r.base_z_min:.2f}"
+                 + ("" if r.base_z_min == r.base_z_max
+                    else f" – {r.base_z_max:.2f}") + " m",
+                 f"Cell size: {r.cell_m:.2f} m ({r.n_cells:,} cells)"]
+        if r.warnings:
+            lines += [""] + ["⚠ " + w for w in r.warnings]
+        QMessageBox.information(self, "Volume measurement", "\n".join(lines))
 
     # -- coordinate helpers -------------------------------------------------
     def _project_to_mercator(self):

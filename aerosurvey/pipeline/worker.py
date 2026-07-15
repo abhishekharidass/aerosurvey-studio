@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import List
 
 from PySide6.QtCore import QThread, Signal
@@ -52,11 +53,15 @@ class PipelineWorker(QThread):
             ctx = StageContext(self.chunk, self.workdir,
                                lambda m, lvl="info": self.log.emit(m, lvl),
                                progress, self._cancelled)
+            t0 = time.time()
             try:
                 ok = stage.run(ctx)
             except Exception as exc:  # keep the app alive on stage errors
                 self.log.emit(f"{stage.name} failed: {exc}", "error")
                 ok = False
+            if ok:  # durations feed the processing report
+                self.chunk.stats.setdefault("stage_seconds", {})[stage.key] = \
+                    round(time.time() - t0, 1)
             self.stage_finished.emit(stage.key, ok)
             if ok:
                 self.outputs_changed.emit()

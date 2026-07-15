@@ -87,6 +87,28 @@ def _fmt(v, unit="", nd=3):
     return f"{v}{unit}"
 
 
+def _ortho_area_ha(path: str):
+    """Actual covered area (alpha > 0) of the orthomosaic, in hectares."""
+    import rasterio
+    with rasterio.open(path) as s:
+        if s.count < 4:
+            return abs(s.width * s.height * s.transform.a * s.transform.e) / 1e4
+        scale = max(max(s.width, s.height) / 1024.0, 1.0)
+        h, w = max(int(s.height / scale), 1), max(int(s.width / scale), 1)
+        alpha = s.read(4, out_shape=(h, w))
+        frac = float((alpha > 0).mean())
+        return abs(s.width * s.height * s.transform.a * s.transform.e) * frac / 1e4
+
+
+def _hms(sec: float) -> str:
+    sec = int(round(sec))
+    if sec < 60:
+        return f"{sec} s"
+    if sec < 3600:
+        return f"{sec // 60} min {sec % 60:02d} s"
+    return f"{sec // 3600} h {sec % 3600 // 60:02d} min"
+
+
 def generate_report(chunk, out_path: str) -> str:
     s = chunk.stats or {}
     o = chunk.outputs
@@ -141,13 +163,71 @@ def generate_report(chunk, out_path: str) -> str:
                      f"<span class='bval'>{n:,} ({pct:.1f}%)</span></div>")
         cls_section = f"<h2>Point-Cloud Classification</h2><div class='bars'>{bars}</div>"
 
+    # per-axis georeferencing accuracy
+    axis_row = ""
+    xyz = s.get("georef_rmse_xyz_m")
+    if xyz and len(xyz) == 3:
+        axis_row = (f"<tr><td>Georeferencing RMSE per axis</td>"
+                    f"<td>X {xyz[0]:.3f} m &nbsp;·&nbsp; Y {xyz[1]:.3f} m "
+                    f"&nbsp;·&nbsp; Z {xyz[2]:.3f} m</td></tr>")
+
+    # camera self-calibration
+    calib_section = ""
+    cal = s.get("calibration") or {}
+    if cal:
+        k1 = f"<tr><td>Radial distortion k1</td><td>{cal['k1']:+.6f}</td></tr>" \
+            if "k1" in cal else ""
+        calib_section = f"""
+        <h2>Camera Calibration</h2>
+        <table class="summary">
+        <tr><td>Focal length</td><td>{_fmt(cal.get('focal_px'), ' px', 2)}</td></tr>
+        <tr><td>Principal point</td><td>({_fmt(cal.get('cx'), '', 2)},
+            {_fmt(cal.get('cy'), '', 2)}) px</td></tr>
+        {k1}
+        <tr><td>Source</td><td>{cal.get('source', '&mdash;')}</td></tr>
+        </table>"""
+
+    # processing durations
+    time_section = ""
+    times = s.get("stage_seconds") or {}
+    if times:
+        stage_names = {"align": "Align Photos", "georef": "Georeference",
+                       "dense": "Dense Cloud", "mesh": "Textured Mesh",
+                       "classify": "Classify", "dsm": "DSM", "dtm": "DTM",
+                       "ortho": "Orthomosaic"}
+        rows = "".join(f"<tr><td>{stage_names.get(k, k)}</td><td>{_hms(v)}</td></tr>"
+                       for k, v in times.items())
+        time_section = f"""
+        <h2>Processing Time</h2>
+        <table class="summary">{rows}
+        <tr><td><b>Total</b></td><td><b>{_hms(sum(times.values()))}</b></td></tr>
+        </table>"""
+
     # outputs table
     def spec(d):
         return f"{d['w']}&times;{d['h']} @ {d['gsd_m']:.3f} m/px" if d else "&mdash;"
-    out_rows = (f"<tr><td>Orthomosaic</td><td>{spec(s.get('ortho'))}</td>"
+    dense_spec = "&mdash;"
+    if s.get("dense_points"):
+        dense_spec = f"{s['dense_points']:,} points"
+        if s.get("dense_density_ppm2"):
+            dense_spec += f" (~{s['dense_density_ppm2']:.0f} pts/m²)"
+    mesh_spec = (f"{s.get('mesh_vertices', 0):,} vertices · "
+                 f"{s.get('mesh_faces', 0):,} faces") if s.get("mesh_faces") else "&mdash;"
+    out_rows = (f"<tr><td>Dense point cloud</td><td>{dense_spec}</td>"
+                f"<td>{'✓' if o.dense_cloud else '&mdash;'}</td></tr>"
+                f"<tr><td>Textured mesh</td><td>{mesh_spec}</td>"
+                f"<td>{'✓' if o.mesh else '&mdash;'}</td></tr>"
+                f"<tr><td>Orthomosaic</td><td>{spec(s.get('ortho'))}</td>"
                 f"<td>{'✓' if o.orthomosaic else '&mdash;'}</td></tr>"
                 f"<tr><td>DSM</td><td>{spec(s.get('dsm'))}</td><td>{'✓' if o.dsm else '&mdash;'}</td></tr>"
                 f"<tr><td>DTM</td><td>{spec(s.get('dtm'))}</td><td>{'✓' if o.dtm else '&mdash;'}</td></tr>")
+    area_note = ""
+    if o.orthomosaic and os.path.exists(o.orthomosaic):
+        try:
+            area_note = (f"<p class='note'>Covered area: "
+                         f"{_ortho_area_ha(o.orthomosaic):.2f} ha</p>")
+        except Exception:
+            pass
 
     # thumbnails
     thumbs = ""
@@ -204,13 +284,17 @@ figcaption{{font-size:12px;color:#777;text-align:center;margin-top:4px}}
 <tr><td>Sparse tie points</td><td>{f"{s.get('sparse_points',0):,}" if s.get('sparse_points') else '&mdash;'}</td></tr>
 <tr><td>Bundle-adjustment RMSE</td><td>{_fmt(s.get('ba_rmse_px'),' px')}</td></tr>
 <tr><td>Georeferencing method</td><td>{s.get('georef_method','&mdash;')}</td></tr>
+{axis_row}
 </table>
+{calib_section}
 {gcp_section}
 {cls_section}
 
 <h2>Output Products</h2>
 <table><thead><tr><th>Product</th><th>Specification</th><th>Generated</th></tr></thead>
 <tbody>{out_rows}</tbody></table>
+{area_note}
+{time_section}
 
 <h2>Previews</h2>
 <div class="gallery">{thumbs or '<p class="note">No raster products available.</p>'}</div>

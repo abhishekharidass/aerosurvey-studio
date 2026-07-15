@@ -34,6 +34,13 @@ class ProcessingSettings:
     # SfM feature budget per image (more = denser sparse cloud, slower).
     sfm_max_features: int = 8192
 
+    # Include the textured-mesh stage in full pipeline runs (CPU-heavy;
+    # the stage is always available on demand from the Workflow menu).
+    build_mesh: bool = False
+    # Decimate the reconstructed mesh to at most this many faces before
+    # texturing (0 = no limit; full-density meshes are untexturable).
+    mesh_max_faces: int = 2_000_000
+
     @classmethod
     def from_dict(cls, d: dict) -> "ProcessingSettings":
         known = {f.name for f in fields(cls)}
@@ -47,6 +54,7 @@ class Outputs:
     sparse_cloud: str = ""
     dense_cloud: str = ""
     classified_cloud: str = ""
+    mesh: str = ""
     dsm: str = ""
     dtm: str = ""
     orthomosaic: str = ""

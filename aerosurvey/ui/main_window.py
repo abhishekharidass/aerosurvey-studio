@@ -95,6 +95,7 @@ class MainWindow(QMainWindow):
         self.act_import_gcps = mk("Import GCPs…", self.import_gcps, "Ctrl+Shift+G")
         self.act_export = mk("Export Products…", self.export_products, "Ctrl+E")
         self.act_contours = mk("Export Contour Lines…", self.export_contours, "Ctrl+Shift+C")
+        self.act_webtiles = mk("Export Web Tiles / KML…", self.export_webtiles)
         self.act_report = mk("Generate Processing Report…", self.generate_report_action, "Ctrl+Shift+R")
         self.act_quit = mk("Exit", self.close, "Ctrl+Q")
 
@@ -136,6 +137,7 @@ class MainWindow(QMainWindow):
         m_file.addSeparator()
         m_file.addAction(self.act_export)
         m_file.addAction(self.act_contours)
+        m_file.addAction(self.act_webtiles)
         m_file.addAction(self.act_report)
         m_file.addSeparator()
         m_file.addAction(self.act_quit)
@@ -341,6 +343,35 @@ class MainWindow(QMainWindow):
                 self, "Contours",
                 "Exported:\n" + "\n".join(os.path.basename(p) for p in written))
 
+    def export_webtiles(self):
+        from ..core import webtiles as tilemod
+        from .dialogs import WebTilesDialog
+        o = self.state.chunk.outputs
+        if not (o.orthomosaic and os.path.exists(o.orthomosaic)):
+            QMessageBox.information(self, "Web tiles",
+                                    "No orthomosaic yet — run the workflow first.")
+            return
+        dlg = WebTilesDialog(self)
+        if not dlg.exec():
+            return
+        zmin, zmax, kml = dlg.result_options()
+        out = QFileDialog.getExistingDirectory(self, "Export web tiles to folder")
+        if not out:
+            return
+        emit = lambda m, lvl="info": self.state.log.emit(m, lvl)
+        try:
+            meta = tilemod.export_web_tiles(
+                o.orthomosaic, out, zmin, zmax, kml=kml,
+                name=self.state.project.name, log=emit)
+        except Exception as exc:
+            QMessageBox.critical(self, "Web tiles", f"Tile export failed:\n{exc}")
+            return
+        QMessageBox.information(
+            self, "Web tiles",
+            f"Wrote {meta['tiles']} tiles (zoom {meta['min_zoom']}–"
+            f"{meta['max_zoom']}) to:\n{out}"
+            + ("\n\nOpen doc.kml in Google Earth to view." if kml else ""))
+
     def generate_report_action(self):
         from ..report import generate_report
         ch = self.state.chunk
@@ -429,7 +460,10 @@ class MainWindow(QMainWindow):
 
     # -- pipeline --------------------------------------------------------
     def run_all(self):
-        self.run_stages([s.key for s in PIPELINE])
+        # the mesh stage is opt-in for full runs (Tools > Processing Settings)
+        build_mesh = self.state.chunk.settings.build_mesh
+        self.run_stages([s.key for s in PIPELINE
+                         if s.key != "mesh" or build_mesh])
 
     def run_stages(self, keys):
         if self._worker and self._worker.isRunning():
