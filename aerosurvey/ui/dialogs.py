@@ -301,3 +301,57 @@ class EngineStatusDialog(QDialog):
         bb.accepted.connect(self.accept)
         bb.button(QDialogButtonBox.Close).clicked.connect(self.accept)
         lay.addWidget(bb)
+
+
+class ContourDialog(QDialog):
+    """Options for the contour-lines export (source, interval, formats)."""
+
+    def __init__(self, parent, has_dtm: bool, has_dsm: bool):
+        super().__init__(parent)
+        from PySide6.QtWidgets import QCheckBox
+        self.setWindowTitle("Export Contour Lines")
+        self.setMinimumWidth(380)
+
+        lay = QVBoxLayout(self)
+        form = QFormLayout()
+        self.source = QComboBox()
+        if has_dtm:
+            self.source.addItem("DTM (terrain — recommended)", "dtm")
+        if has_dsm:
+            self.source.addItem("DSM (surface incl. buildings)", "dsm")
+        form.addRow("Elevation source:", self.source)
+
+        self.interval = QDoubleSpinBox()
+        self.interval.setRange(0.1, 100.0)
+        self.interval.setDecimals(2)
+        self.interval.setSingleStep(0.5)
+        self.interval.setValue(1.0)
+        self.interval.setSuffix(" m")
+        form.addRow("Contour interval:", self.interval)
+        lay.addLayout(form)
+
+        lay.addWidget(QLabel("Output formats:"))
+        self.cb_shp = QCheckBox("Shapefile (.shp — GIS)")
+        self.cb_dxf = QCheckBox("DXF (.dxf — CAD)")
+        self.cb_geojson = QCheckBox("GeoJSON (.geojson — web)")
+        for cb in (self.cb_shp, self.cb_dxf, self.cb_geojson):
+            cb.setChecked(True)
+            lay.addWidget(cb)
+
+        hint = QLabel("Every 5th level is flagged as an index contour "
+                      "(CONTOUR_MAJOR layer / INDEX attribute).")
+        hint.setStyleSheet(f"color: {FG_MUTED};")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+    def result_options(self):
+        formats = tuple(f for f, cb in (("shp", self.cb_shp),
+                                        ("dxf", self.cb_dxf),
+                                        ("geojson", self.cb_geojson))
+                        if cb.isChecked())
+        return (self.source.currentData(), float(self.interval.value()), formats)

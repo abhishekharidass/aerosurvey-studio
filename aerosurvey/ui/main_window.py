@@ -94,6 +94,7 @@ class MainWindow(QMainWindow):
         self.act_import_photos = mk("Import Photos…", self.import_photos, "Ctrl+Shift+P")
         self.act_import_gcps = mk("Import GCPs…", self.import_gcps, "Ctrl+Shift+G")
         self.act_export = mk("Export Products…", self.export_products, "Ctrl+E")
+        self.act_contours = mk("Export Contour Lines…", self.export_contours, "Ctrl+Shift+C")
         self.act_report = mk("Generate Processing Report…", self.generate_report_action, "Ctrl+Shift+R")
         self.act_quit = mk("Exit", self.close, "Ctrl+Q")
 
@@ -134,6 +135,7 @@ class MainWindow(QMainWindow):
             m_file.addAction(a)
         m_file.addSeparator()
         m_file.addAction(self.act_export)
+        m_file.addAction(self.act_contours)
         m_file.addAction(self.act_report)
         m_file.addSeparator()
         m_file.addAction(self.act_quit)
@@ -307,6 +309,37 @@ class MainWindow(QMainWindow):
         self.state.log.emit(f"Exported {len(done)} product(s) to {out}.", "ok")
         QMessageBox.information(self, "Export",
                                 f"Exported {len(done)} product(s) to:\n{out}")
+
+    def export_contours(self):
+        from ..core import contours as contmod
+        from .dialogs import ContourDialog
+        o = self.state.chunk.outputs
+        has_dtm = bool(o.dtm and os.path.exists(o.dtm))
+        has_dsm = bool(o.dsm and os.path.exists(o.dsm))
+        if not (has_dtm or has_dsm):
+            QMessageBox.information(self, "Contours",
+                                    "No DSM/DTM yet — run the surface stages first.")
+            return
+        dlg = ContourDialog(self, has_dtm, has_dsm)
+        if not dlg.exec():
+            return
+        source, interval, formats = dlg.result_options()
+        if not formats:
+            return
+        out = QFileDialog.getExistingDirectory(self, "Export contours to folder")
+        if not out:
+            return
+        emit = lambda m, lvl="info": self.state.log.emit(m, lvl)
+        try:
+            written = contmod.export_contours(
+                self.state.chunk, out, interval, source, formats, log=emit)
+        except Exception as exc:
+            QMessageBox.critical(self, "Contours", f"Contour export failed:\n{exc}")
+            return
+        if written:
+            QMessageBox.information(
+                self, "Contours",
+                "Exported:\n" + "\n".join(os.path.basename(p) for p in written))
 
     def generate_report_action(self):
         from ..report import generate_report
