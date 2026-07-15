@@ -19,6 +19,7 @@ from .panels.photos_panel import PhotosPanel
 from .panels.reference_panel import ReferencePanel
 from .panels.workspace_panel import WorkspacePanel
 from .views.image_view import ImageView
+from .views.map_view import MapView
 from .views.model_view import ModelView
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
@@ -52,8 +53,10 @@ class MainWindow(QMainWindow):
     # -- construction ----------------------------------------------------
     def _build_central(self):
         self.tabs = QTabWidget()
+        self.map_view = MapView(self.state)
         self.model_view = ModelView(self.state)
         self.image_view = ImageView(self.state)
+        self.tabs.addTab(self.map_view, "  Map  ")
         self.tabs.addTab(self.model_view, "  3D Model & Maps  ")
         self.tabs.addTab(self.image_view, "  Photo / GCP Marking  ")
         self.setCentralWidget(self.tabs)
